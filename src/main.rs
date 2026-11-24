@@ -915,7 +915,8 @@ fn main_pane(s: &App, k: &Kit) -> El {
     let mut head = col().w_full().px(16.0).py(12.0).gap(4.0).child(
         text(schedule::describe(bot, now))
             .font(k.ty.ui_medium)
-            .color(k.c.text_base),
+            .color(k.c.text_base)
+            .wrap(),
     );
     if let Some(n) = &bot.note {
         head = head.child(
@@ -1013,7 +1014,7 @@ fn main_pane(s: &App, k: &Kit) -> El {
                 .w_full()
                 .items_start()
                 .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_muted)
-                .child(head.grow(1.0))
+                .child(head.grow(1.0).min_w(0.0))
                 .child(row().padding(12.0).child(delete)),
         )
         .child(

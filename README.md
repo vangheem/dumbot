@@ -22,11 +22,17 @@ Each bot lives in `~/.local/share/dumbot/bots/<slug>/`:
   directory, so opencode loads it into every session. The bot rewrites it as it learns.
 - `memory/*.md`: everything else it keeps (notes, logs, to-dos, things already handled).
 - `bot.json`: dumBot's record of the bot's model, schedule and runs.
-- `.opencode/agents/dumbot.md`: the `dumbot` opencode agent every run uses, rewritten by
-  dumBot before each run. Its system prompt is the bot's operating loop: read memory, do the
-  work, keep `AGENTS.md` current as it learns, review itself and add a changelog line, then
-  schedule the next run. Its permissions let the bot edit its own folder and run
-  `dumbot wake` without asking.
+- `.opencode/`: what dumBot writes before every run (from `src/prompts/`):
+  - `agents/dumbot.md`: the agent every run uses. Its system prompt is the bot's operating
+    loop: journal and update memory after each step, edit `AGENTS.md` the moment it learns
+    something, fan independent work out to several subagents at once, review itself, then
+    schedule the next run. It may edit its folder and run `dumbot wake` without asking.
+  - `agents/dumbot-worker.md`: a subagent for parallel tasks, which writes its results under
+    `memory/work/`.
+  - `skills/dumbot-evolve/SKILL.md`: how to restructure `AGENTS.md` and write its own skills
+    and subagents.
+
+  The bot's own skills and subagents live beside them, and show up in the app.
 
 The folder is a git repository, because opencode only loads a folder's `AGENTS.md` and
 `.opencode/` agents in a project.
@@ -35,17 +41,20 @@ Every run is a new opencode session. Its first prompt says why the bot woke up a
 any note its last run left. Bots schedule themselves with:
 
 ```sh
-dumbot wake <bot> in 30m                     # or: in 2h, in 1d, at 09:00, at 2026-12-01 09:00
+dumbot wake <bot> in 30m                     # one-off: in 2h, in 1d, at 09:00, at 2026-12-01 09:00
 dumbot wake <bot> every 6h --note "check the PR queue first"
-dumbot wake <bot> off
+dumbot wake <bot> on wed,thu at 19:00        # weekly rules add up: mon..sun, weekdays,
+dumbot wake <bot> on sat,sun at 10:00,18:00  #   weekends, daily; several times per rule
+dumbot wake <bot> off                        # clears everything
 dumbot list
 dumbot run <bot> [message]                   # start a run now, from a script or cron
 ```
 
-`dumbot wake` writes `bot.json`. The running app re-reads bots every few seconds and starts
-the ones that are due. A bot whose last run is still working waits for it to finish. Bots
-only wake while the app is running; a wake-up missed while it was closed runs when it next
-starts.
+A bot wakes at the earliest of its one-off, interval and weekly times. `dumbot wake` writes
+`bot.json`; the running app re-reads bots every few seconds and starts the ones that are due.
+A bot whose last run is still working (or waiting on its subagents) waits for it to finish.
+Bots only wake while the app is running; times missed while it was closed run once when it
+next starts.
 
 ## Features
 
