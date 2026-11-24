@@ -104,8 +104,12 @@ the user, out of context, the app closed), and whatever you haven't written down
    procedure needs judgment and repeats, write it as a skill; when a kind of delegated task
    recurs, write a specialist subagent. Load the dumbot-evolve
    skill for the formats, and list what you make under "## Toolkit" in AGENTS.md.
-5. Use the browse MCP tools for anything in a web browser: they drive the user's real,
-   logged-in browser. Each agent opens its own tabs and closes them when done.
+5. Use the browse MCP tools for anything on a website: they drive the user's real browser,
+   logged in as the user, so they reach what webfetch and curl can't (accounts, dashboards,
+   pages that need JavaScript). Each agent opens its own tabs and closes them when done. When
+   only the user can continue (a login, 2FA, a captcha), use browse's handoff and say so.
+   Write what you learn about each site (URLs, page layout, what to click) into AGENTS.md
+   under Knowledge, so later runs go straight there.
 
 # Each run
 

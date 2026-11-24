@@ -83,16 +83,42 @@ next starts.
 - The bot's markdown files, rendered, refreshed as runs change them.
 - Each run's model, token usage and cost, and its transcript: tool calls, permission requests to allow or reject, a composer to
   message the run, **Stop**, and **Open in terminal** (attaches the opencode TUI).
-- **Run now** (with the composer text as a message, if any), **Schedule…** by hand, and
-  **Open folder** to edit files yourself.
+- A **Schedule** tab listing each wake-up (a one-off, an interval, each weekly rule) with its
+  next time and note, to remove any of them or add one: once on a day and time, weekly on
+  chosen days, or repeating every so many minutes, hours or days.
+- **Run now** (with the composer text as a message, if any), and **Open folder** to edit
+  files yourself.
 - A default model (bottom of the sidebar) and a model per bot. Changing either also switches
   the bot's latest run, so a run that's working or that you message next uses it.
+
+## Browser automation with browse
+
+Most useful bots work on websites: your email, a fantasy league, a store, an admin
+dashboard. Many of those sites have no API, or need you logged in. **browse** is what makes
+those bots possible. It's an MCP server that drives your real Chrome-family browser, with
+your logins, cookies and extensions, through the browse browser extension. A bot can open a
+tab, read the page, click, fill in forms and take screenshots as you would, and you can watch
+it work or take over (for a login, 2FA or a captcha).
+
+dumBot builds on it:
+
+- Every bot's instructions tell it to use the browse tools for anything in a browser, and to
+  write down what it learns about a site (URLs, page layout, what to click) in its
+  `AGENTS.md`, so later runs go straight to the right page.
+- Subagents each open their own tabs, so a bot can research several pages at once.
+- Bots can turn browser routines into skills and scripts that later runs reuse.
+
+To set it up, add the browse extension from the
+[Chrome Web Store](https://chromewebstore.google.com/detail/mfnicocicmmlkpjnaffgihfjhdgjkdjg),
+then run `browse install` and pick opencode. That adds browse to opencode's MCP servers and
+pairs the extension; `browse status` checks it. Bots without browse still work, but only
+with what the shell and simple web fetches can reach.
 
 ## Requirements
 
 - [`opencode`](https://opencode.ai) v2. dumBot uses opencode's shared background service
   (the one the TUI uses) and starts it when it isn't running.
-- For browser automation, the browse MCP server configured in opencode.
+- Strongly recommended: [browse](#browser-automation-with-browse), so bots can use your browser.
 
 ## Install
 

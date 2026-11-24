@@ -146,9 +146,9 @@ pub fn apply(bot: &mut Bot, schedule: Schedule, note: Option<String>, now: i64) 
             bot.note = note;
         }
         Schedule::Every(secs) => {
-            bot.next_run = Some(now + secs);
             bot.every = Some(secs);
-            bot.note = note;
+            bot.every_next = Some(now + secs);
+            bot.every_note = note;
         }
         Schedule::Weekly(rules) => {
             for mut r in rules {
@@ -166,10 +166,9 @@ pub fn apply(bot: &mut Bot, schedule: Schedule, note: Option<String>, now: i64) 
             bot.last_wake = Some(now);
         }
         Schedule::Off => {
-            bot.next_run = None;
-            bot.every = None;
+            remove(bot, Item::Once);
+            remove(bot, Item::Every);
             bot.rules.clear();
-            bot.note = None;
         }
     }
 }
@@ -183,6 +182,7 @@ pub fn next(bot: &Bot, now: i64) -> Option<i64> {
         .iter()
         .filter_map(|r| rule_next(r, after))
         .chain(bot.next_run)
+        .chain(bot.every_next)
         .min()
 }
 
@@ -213,36 +213,88 @@ pub fn fired(bot: &mut Bot, now: i64) -> Vec<String> {
         .filter_map(|r| Some(format!("{}: {}", rule(r), r.note.as_ref()?)))
         .collect();
     bot.last_wake = Some(now);
+    if bot.every_next.is_some_and(|t| t <= now) {
+        bot.every_next = bot.every.map(|e| now + e);
+        notes.extend(bot.every_note.clone());
+    }
     if bot.next_run.is_some_and(|t| t <= now) {
-        bot.next_run = bot.every.map(|e| now + e);
-        let note = if bot.every.is_some() {
-            bot.note.clone()
-        } else {
-            bot.note.take()
-        };
-        notes.extend(note);
+        bot.next_run = None;
+        notes.extend(bot.note.take());
     }
     notes
 }
 
+/// One of a bot's wake-ups, as listed in the app.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Item {
+    Once,
+    Every,
+    /// By index in `rules`.
+    Rule(usize),
+}
+
+pub fn items(bot: &Bot) -> Vec<Item> {
+    let mut out = Vec::new();
+    if bot.next_run.is_some() {
+        out.push(Item::Once);
+    }
+    if bot.every.is_some() {
+        out.push(Item::Every);
+    }
+    out.extend((0..bot.rules.len()).map(Item::Rule));
+    out
+}
+
+pub fn remove(bot: &mut Bot, item: Item) {
+    match item {
+        Item::Once => {
+            bot.next_run = None;
+            bot.note = None;
+        }
+        Item::Every => {
+            bot.every = None;
+            bot.every_next = None;
+            bot.every_note = None;
+        }
+        Item::Rule(i) if i < bot.rules.len() => {
+            bot.rules.remove(i);
+        }
+        Item::Rule(_) => {}
+    }
+}
+
+/// An item's kind, when it next fires, and its note.
+pub fn item(bot: &Bot, item: Item, now: i64) -> (String, String, Option<String>) {
+    let after = bot.last_wake.unwrap_or(now);
+    let at = |t: Option<i64>| t.map_or(String::new(), |t| when(t, now));
+    match item {
+        Item::Once => ("Once".into(), at(bot.next_run), bot.note.clone()),
+        Item::Every => (
+            format!("Every {}", span(bot.every.unwrap_or(0))),
+            format!("next {}", at(bot.every_next)),
+            bot.every_note.clone(),
+        ),
+        Item::Rule(i) => match bot.rules.get(i) {
+            Some(r) => (
+                format!("Weekly · {}", rule(r)),
+                format!("next {}", at(rule_next(r, after))),
+                r.note.clone(),
+            ),
+            None => Default::default(),
+        },
+    }
+}
+
 /// Each wake-up and its note, one per line, for `dumbot list`.
 pub fn details(bot: &Bot, now: i64) -> Vec<String> {
-    let note = |n: &Option<String>| n.as_ref().map_or(String::new(), |n| format!(": {n}"));
-    let mut out = Vec::new();
-    match (bot.next_run, bot.every) {
-        (Some(t), None) => out.push(format!("once {}{}", when(t, now), note(&bot.note))),
-        (Some(t), Some(e)) => out.push(format!(
-            "every {}, next {}{}",
-            span(e),
-            when(t, now),
-            note(&bot.note)
-        )),
-        _ => {}
-    }
-    for r in &bot.rules {
-        out.push(format!("{}{}", rule(r), note(&r.note)));
-    }
-    out
+    items(bot)
+        .into_iter()
+        .map(|i| {
+            let (kind, at, note) = item(bot, i, now);
+            let note = note.map_or(String::new(), |n| format!(": {n}"));
+            format!("{kind} ({at}){note}")
+        })
+        .collect()
 }
 
 /// `Wed, Thu 19:00`, `Weekdays 08:30`, `Daily 07:00`.
@@ -263,6 +315,29 @@ pub fn rule(r: &Rule) -> String {
             .join(", "),
     };
     format!("{days} {}", r.time)
+}
+
+/// `HH:MM` local time `days` days from today, in Unix seconds.
+pub fn local_at(days: i64, time: &str, now: i64) -> Option<i64> {
+    let t = NaiveTime::parse_from_str(time, "%H:%M").ok()?;
+    let today = Local.timestamp_opt(now, 0).single()?.date_naive();
+    let dt = (today + Duration::days(days)).and_time(t);
+    Local
+        .from_local_datetime(&dt)
+        .earliest()
+        .map(|d| d.timestamp())
+}
+
+/// `Today`, `Tomorrow`, `Thu Nov 26` for the day `days` from today.
+pub fn day_label(days: i64, now: i64) -> String {
+    match days {
+        0 => "Today".into(),
+        1 => "Tomorrow".into(),
+        _ => Local
+            .timestamp_opt(now + days * 86400, 0)
+            .single()
+            .map_or(String::new(), |d| d.format("%a %b %-d").to_string()),
+    }
 }
 
 /// `Today 14:30`, `Tomorrow 09:00`, `Mon Dec 1 09:00`.
@@ -310,12 +385,13 @@ pub fn next_line(bot: &Bot, now: i64) -> String {
 /// A bot's whole schedule: `Next: Today 14:30 · every 2h · Wed, Thu 19:00`.
 pub fn describe(bot: &Bot, now: i64) -> String {
     let mut out = next_line(bot, now);
-    match (bot.next_run, bot.every) {
-        (Some(t), None) if Some(t) != next(bot, now) => {
-            out.push_str(&format!(" · once {}", when(t, now)))
-        }
-        (_, Some(e)) => out.push_str(&format!(" · every {}", span(e))),
-        _ => {}
+    if let Some(t) = bot.next_run
+        && Some(t) != next(bot, now)
+    {
+        out.push_str(&format!(" · once {}", when(t, now)));
+    }
+    if let Some(e) = bot.every {
+        out.push_str(&format!(" · every {}", span(e)));
     }
     for r in &bot.rules {
         out.push_str(&format!(" · {}", rule(r)));
@@ -407,6 +483,25 @@ mod tests {
             fired(&mut bot, local("2026-12-02 19:00")),
             ["Wed 19:00: lineup"]
         );
+        // An interval and a one-off are separate wake-ups with their own notes.
+        apply(
+            &mut bot,
+            Schedule::Every(3600),
+            Some("hourly".into()),
+            monday,
+        );
+        apply(
+            &mut bot,
+            Schedule::At(monday + 600),
+            Some("once".into()),
+            monday,
+        );
+        assert_eq!(items(&bot)[..2], [Item::Once, Item::Every]);
+        assert_eq!(fired(&mut bot, monday + 600), ["once"]);
+        assert_eq!(fired(&mut bot, monday + 3600), ["hourly"]);
+        assert_eq!(bot.every_next, Some(monday + 7200));
+        remove(&mut bot, Item::Every);
+        assert_eq!(items(&bot).len(), bot.rules.len());
         apply(&mut bot, Schedule::Off, None, monday);
         assert_eq!(next(&bot, monday), None);
     }

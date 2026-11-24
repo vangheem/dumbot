@@ -22,7 +22,7 @@ use rune_kit::shell::{
 };
 use rune_kit::{
     Button, ButtonVariant, Combobox, ComboboxOption, ComboboxState, ControlSize, Dialog,
-    IconButton, IconButtonVariant, Kit, Markdown, Spinner, TextArea, TextInput,
+    IconButton, IconButtonVariant, Kit, Markdown, SegmentedControl, Spinner, TextArea, TextInput,
 };
 
 use bots::{Bot, Run};
@@ -40,6 +40,45 @@ enum Confirm {
     Update,
     Delete(String),
 }
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Files,
+    Schedule,
+}
+
+/// The "Add a wake-up" form.
+struct SchedForm {
+    /// 0 once, 1 weekly, 2 repeating.
+    kind: usize,
+    /// Once: days from today.
+    day: usize,
+    /// Once and weekly: `HH:MM`.
+    time: String,
+    /// Weekly: Monday first.
+    days: [bool; 7],
+    /// Repeating: every `every` `unit`s (0 minutes, 1 hours, 2 days).
+    every: TextEdit,
+    unit: usize,
+    note: TextEdit,
+}
+
+impl Default for SchedForm {
+    fn default() -> Self {
+        SchedForm {
+            kind: 0,
+            day: 1,
+            time: "09:00".into(),
+            days: [false; 7],
+            every: TextEdit::new("6"),
+            unit: 1,
+            note: TextEdit::new(""),
+        }
+    }
+}
+
+const UNITS: [(&str, i64); 3] = [("minutes", 60), ("hours", 3600), ("days", 86400)];
+const DAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
 /// The environment variables dialog: global (`bot` none) or one bot's. Values are typed in
 /// and never shown again.
@@ -97,7 +136,10 @@ struct App {
     busy: bool,
     confirm: Option<Confirm>,
     new_bot: Option<(TextEdit, TextEdit)>,
-    schedule_edit: Option<(TextEdit, TextEdit)>,
+    tab: Tab,
+    sched: SchedForm,
+    day_combo: ComboboxState,
+    time_combo: ComboboxState,
     /// The instructions for all bots, being edited.
     instructions: Option<TextEdit>,
     env_edit: Option<EnvEdit>,
@@ -140,7 +182,10 @@ fn init() -> App {
         busy: false,
         confirm: None,
         new_bot: None,
-        schedule_edit: None,
+        tab: Tab::Files,
+        sched: SchedForm::default(),
+        day_combo: ComboboxState::default(),
+        time_combo: ComboboxState::default(),
         instructions: None,
         env_edit: None,
         toast: None,
@@ -484,19 +529,51 @@ impl App {
         }
     }
 
-    fn save_schedule(&mut self) {
-        let (Some(slug), Some((when, note))) = (self.selected.clone(), &self.schedule_edit) else {
+    fn add_wakeup(&mut self) {
+        let Some(slug) = self.selected.clone() else {
             return;
         };
         let now = bots::now();
-        let note = Some(note.text.trim().to_string()).filter(|n| !n.is_empty());
-        let res = schedule::parse(&when.text, now)
-            .and_then(|sched| bots::update(&slug, |b| schedule::apply(b, sched, note, now)));
-        match res {
+        let f = &self.sched;
+        let sched = match f.kind {
+            0 => match schedule::local_at(f.day as i64, &f.time, now) {
+                Some(t) if t > now => schedule::Schedule::At(t),
+                _ => return self.notify("That time has already passed.", true),
+            },
+            1 => {
+                let days: Vec<u8> = (0..7u8).filter(|d| f.days[*d as usize]).collect();
+                if days.is_empty() {
+                    return self.notify("Pick at least one day.", true);
+                }
+                schedule::Schedule::Weekly(vec![bots::Rule {
+                    days,
+                    time: f.time.clone(),
+                    note: None,
+                }])
+            }
+            _ => match f.every.text.trim().parse::<i64>() {
+                Ok(n) if n > 0 => schedule::Schedule::Every(n * UNITS[f.unit].1),
+                _ => return self.notify("Enter how often, as a whole number.", true),
+            },
+        };
+        let note = Some(f.note.text.trim().to_string()).filter(|n| !n.is_empty());
+        match bots::update(&slug, |b| schedule::apply(b, sched, note, now)) {
             Ok(b) => {
                 self.bots.insert(slug, b);
-                self.schedule_edit = None;
+                self.sched.note = TextEdit::new("");
                 self.next_scan = 0.0;
+            }
+            Err(e) => self.notify(format!("{e:#}"), true),
+        }
+    }
+
+    fn remove_wakeup(&mut self, item: schedule::Item) {
+        let Some(slug) = self.selected.clone() else {
+            return;
+        };
+        match bots::update(&slug, |b| schedule::remove(b, item)) {
+            Ok(b) => {
+                self.bots.insert(slug, b);
             }
             Err(e) => self.notify(format!("{e:#}"), true),
         }
@@ -781,7 +858,7 @@ fn view(s: &App, cx: &mut Cx<App>) -> El {
                 .truncate(),
         )
         .trailing(toolbar_actions(s, &k));
-    let split = SplitView::new(main_pane(s, &k))
+    let split = SplitView::new(main_pane(s, &k, &mut layer))
         .sidebar(
             &s.sidebar,
             |s: &mut App| &mut s.sidebar,
@@ -855,13 +932,7 @@ fn toolbar_actions(s: &App, k: &Kit) -> El {
             )
             .child(
                 small("Schedule…", ButtonVariant::Ghost)
-                    .on_press(|s: &mut App| {
-                        let mut when = TextEdit::new("");
-                        when.focused = true;
-                        let note =
-                            TextEdit::new(s.bot().and_then(|b| b.note.clone()).unwrap_or_default());
-                        s.schedule_edit = Some((when, note));
-                    })
+                    .on_press(|s: &mut App| s.tab = Tab::Schedule)
                     .build(k),
             )
             .child(
@@ -1004,10 +1075,10 @@ fn sidebar(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     sb.build(k)
 }
 
-fn main_pane(s: &App, k: &Kit) -> El {
+fn main_pane(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     let (Some(slug), Some(bot)) = (s.selected.clone(), s.bot()) else {
         let msg = if s.bots.is_empty() {
-            "Create a bot to get started (⌘N). Describe what it's for; it writes its own instructions and decides when to run."
+            "Create a bot to get started (⌘N). Describe what it's for; it writes its own instructions and decides when to run. With browse set up in opencode, bots can use your browser, logged in as you: most useful bots need it."
         } else {
             "Pick a bot."
         };
@@ -1026,14 +1097,6 @@ fn main_pane(s: &App, k: &Kit) -> El {
             .color(k.c.text_base)
             .wrap(),
     );
-    if let Some(n) = &bot.note {
-        head = head.child(
-            text(format!("Note for next run: {n}"))
-                .font(k.ty.small)
-                .color(k.c.text_muted)
-                .wrap(),
-        );
-    }
     let model = bot.model.as_ref().map_or_else(
         || {
             format!(
@@ -1128,10 +1191,237 @@ fn main_pane(s: &App, k: &Kit) -> El {
         .child(
             row()
                 .w_full()
+                .px(16.0)
+                .py(8.0)
+                .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_muted)
+                .child(
+                    SegmentedControl::new(
+                        &[
+                            "Files".to_string(),
+                            format!("Schedule ({})", schedule::items(bot).len()),
+                        ],
+                        Some((s.tab == Tab::Schedule) as usize),
+                    )
+                    .width(Some(260.0))
+                    .on_pick(|s: &mut App, i, _: &mut Tx| {
+                        s.tab = if i == 1 { Tab::Schedule } else { Tab::Files }
+                    })
+                    .build(k),
+                ),
+        )
+        .child(match s.tab {
+            Tab::Files => row()
+                .w_full()
                 .grow(1.0)
                 .min_h(0.0)
                 .child(list)
                 .child(viewer),
+            Tab::Schedule => schedule_pane(s, k, layer, bot),
+        })
+}
+
+/// The bot's wake-ups, one item each, and the form to add one.
+fn schedule_pane(s: &App, k: &Kit, layer: &mut Vec<El>, bot: &Bot) -> El {
+    let now = bots::now();
+    let heading = |t: &str| {
+        text(t.to_string())
+            .font(k.ty.ui_medium)
+            .color(k.c.text_base)
+    };
+    let card = || {
+        col()
+            .w_full()
+            .padding(12.0)
+            .gap(6.0)
+            .radius(8.0)
+            .border(1.0, k.c.border_muted)
+    };
+
+    let mut list = col().w_full().gap(8.0);
+    let items = schedule::items(bot);
+    if items.is_empty() {
+        list = list.child(
+            text("No wake-ups. The bot runs only when you start it, until it schedules itself.")
+                .font(k.ty.ui)
+                .color(k.c.text_muted)
+                .wrap(),
+        );
+    }
+    for (i, item) in items.into_iter().enumerate() {
+        let (kind, at, note) = schedule::item(bot, item, now);
+        let mut info = col().grow(1.0).min_w(0.0).gap(2.0).child(
+            row()
+                .gap(8.0)
+                .items_center()
+                .child(text(kind).font(k.ty.ui_medium).color(k.c.text_base))
+                .child(text(at).font(k.ty.small).color(k.c.text_faint)),
+        );
+        if let Some(n) = note {
+            info = info.child(text(n).font(k.ty.small).color(k.c.text_muted).wrap());
+        }
+        list = list.child(
+            row()
+                .w_full()
+                .px(12.0)
+                .py(10.0)
+                .gap(12.0)
+                .items_center()
+                .radius(8.0)
+                .fill(k.c.layer_01)
+                .child(info)
+                .child(
+                    small("Remove", ButtonVariant::GhostFaint)
+                        .on_press(move |s: &mut App| s.remove_wakeup(item))
+                        .build(k),
+                )
+                .key(format!("wake/{i}")),
+        );
+    }
+
+    let f = &s.sched;
+    let kind = SegmentedControl::new(&["Once", "Weekly", "Repeating"], Some(f.kind))
+        .width(Some(300.0))
+        .on_pick(|s: &mut App, i, _: &mut Tx| s.sched.kind = i)
+        .build(k);
+    let field = |label: &str, control: El| {
+        row()
+            .w_full()
+            .gap(12.0)
+            .items_center()
+            .child(
+                text(label.to_string())
+                    .font(k.ty.small_medium)
+                    .color(k.c.text_muted)
+                    .w(70.0),
+            )
+            .child(control)
+    };
+    let times: Vec<ComboboxOption> = (0..96)
+        .map(|q| {
+            let t = format!("{:02}:{:02}", q / 4, q % 4 * 15);
+            ComboboxOption::new(t.clone(), t)
+        })
+        .collect();
+    let time = Combobox::new("wake-time", &s.time_combo, &times, |s: &mut App| {
+        &mut s.time_combo
+    })
+    .label("Time")
+    .current(Some(f.time.as_str()))
+    .search_placeholder("e.g. 19:30")
+    .width(140.0)
+    .max_height(280.0)
+    .on_choose(|s: &mut App, id: &str, _: &mut Tx| s.sched.time = id.to_string())
+    .build(k, layer);
+    let mut form = card().gap(12.0).child(heading("Add a wake-up")).child(kind);
+    match f.kind {
+        0 => {
+            let days: Vec<ComboboxOption> = (0..14)
+                .map(|d| ComboboxOption::new(d.to_string(), schedule::day_label(d, now)))
+                .collect();
+            let day = Combobox::new("wake-day", &s.day_combo, &days, |s: &mut App| {
+                &mut s.day_combo
+            })
+            .label("Day")
+            .current(Some(f.day.to_string().as_str()))
+            .width(200.0)
+            .max_height(280.0)
+            .on_choose(|s: &mut App, id: &str, _: &mut Tx| s.sched.day = id.parse().unwrap_or(0))
+            .build(k, layer);
+            form = form.child(field("Day", day)).child(field("Time", time));
+        }
+        1 => {
+            let mut toggles = row().gap(4.0);
+            for (d, name) in DAY_NAMES.iter().enumerate() {
+                toggles = toggles.child(
+                    small(
+                        name,
+                        if f.days[d] {
+                            ButtonVariant::Contrast
+                        } else {
+                            ButtonVariant::Outline
+                        },
+                    )
+                    .on_press(move |s: &mut App| s.sched.days[d] ^= true)
+                    .build(k),
+                );
+            }
+            let preset = |label: &'static str, days: [bool; 7]| {
+                small(label, ButtonVariant::Ghost)
+                    .on_press(move |s: &mut App| s.sched.days = days)
+                    .build(k)
+            };
+            let presets = row()
+                .gap(4.0)
+                .child(preset(
+                    "Weekdays",
+                    [true, true, true, true, true, false, false],
+                ))
+                .child(preset(
+                    "Weekends",
+                    [false, false, false, false, false, true, true],
+                ))
+                .child(preset("Every day", [true; 7]));
+            form = form
+                .child(field("Days", toggles))
+                .child(field("", presets))
+                .child(field("Time", time));
+        }
+        _ => {
+            let n = TextInput::new(&f.every)
+                .width(Some(80.0))
+                .on_edit(|s: &mut App| &mut s.sched.every)
+                .on_submit(|s: &mut App, _| s.add_wakeup())
+                .build(k);
+            let unit = SegmentedControl::new(&UNITS.map(|u| u.0), Some(f.unit))
+                .width(Some(260.0))
+                .on_pick(|s: &mut App, i, _: &mut Tx| s.sched.unit = i)
+                .build(k);
+            form = form.child(field(
+                "Every",
+                row().gap(8.0).items_center().child(n).child(unit),
+            ));
+        }
+    }
+    let note = TextInput::new(&f.note)
+        .placeholder("Optional: what this run should do")
+        .width(None)
+        .on_edit(|s: &mut App| &mut s.sched.note)
+        .on_submit(|s: &mut App, _| s.add_wakeup())
+        .build(k);
+    form = form.child(field("Note", note.grow(1.0))).child(
+        row().w_full().child(row().grow(1.0)).child(
+            Button::new("Add wake-up")
+                .variant(ButtonVariant::Contrast)
+                .on_press(|s: &mut App| s.add_wakeup())
+                .build(k),
+        ),
+    );
+
+    col()
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(
+            col()
+                .w_full()
+                .max_w(720.0)
+                .padding(20.0)
+                .gap(16.0)
+                .child(heading("Wake-ups"))
+                .child(
+                    text(format!(
+                        "{}. Bots also schedule themselves with `dumbot wake` as they work.",
+                        schedule::next_line(bot, now)
+                    ))
+                    .font(k.ty.small)
+                    .color(k.c.text_faint)
+                    .wrap(),
+                )
+                .child(list)
+                .child(form),
         )
 }
 
@@ -1553,7 +1843,6 @@ static EMPTY_VARS: std::collections::BTreeMap<String, String> = std::collections
 fn close_dialogs(s: &mut App) {
     s.confirm = None;
     s.new_bot = None;
-    s.schedule_edit = None;
     s.instructions = None;
     s.env_edit = None;
 }
@@ -1650,43 +1939,10 @@ fn dialogs(s: &App, k: &Kit, layer: &mut Vec<El>) {
             "new-bot",
             "New bot",
             Some(
-                "It starts with this purpose in its AGENTS.md, then rewrites its own instructions and picks its schedule on its first run.",
+                "It starts with this purpose in its AGENTS.md, then rewrites its own instructions and picks its schedule on its first run. Bots use your browser (logged in as you) through browse, so describe sites by name: \"my ESPN fantasy team\".",
             ),
             vec![label(k, "Name"), name, label(k, "Purpose"), purpose],
             vec![cancel(k), create],
-            k,
-            layer,
-        );
-    }
-    if let Some((when, note)) = &s.schedule_edit {
-        let when = TextInput::new(when)
-            .placeholder("in 2h · at 09:00 · every 6h · on wed,thu at 19:00 · off")
-            .width(None)
-            .on_edit(|s: &mut App| &mut s.schedule_edit.as_mut().expect("dialog open").0)
-            .on_submit(|s: &mut App, _| s.save_schedule())
-            .build(k);
-        let note = TextInput::new(note)
-            .placeholder("Optional note for the next run")
-            .width(None)
-            .on_edit(|s: &mut App| &mut s.schedule_edit.as_mut().expect("dialog open").1)
-            .on_submit(|s: &mut App, _| s.save_schedule())
-            .build(k);
-        let save = Button::new("Save")
-            .variant(ButtonVariant::Contrast)
-            .on_press(|s: &mut App| s.save_schedule())
-            .build(k);
-        let current = s
-            .bot()
-            .map(|b| schedule::describe(b, bots::now()))
-            .unwrap_or_default();
-        modal(
-            "schedule",
-            "Schedule",
-            Some(&format!(
-                "{current}. Bots usually set this themselves with `dumbot wake`."
-            )),
-            vec![label(k, "When"), when, label(k, "Note"), note],
-            vec![cancel(k), save],
             k,
             layer,
         );
@@ -1807,6 +2063,7 @@ fn demo(s: &mut App) {
     let bot = |name: &str, next: Option<i64>, every: Option<i64>| Bot {
         name: name.into(),
         next_run: next,
+        every_next: every.map(|e| now + e),
         every,
         ..Bot::default()
     };
@@ -1819,9 +2076,16 @@ fn demo(s: &mut App) {
     }];
     s.bots.insert("inbox-triager".into(), inbox);
     let mut ff = bot("Fantasy football", None, None);
-    for r in ["on wed,thu at 19:00", "on sat at 09:00", "on sun at 11:30"] {
-        schedule::apply(&mut ff, schedule::parse(r, now).unwrap(), None, now);
+    for (r, note) in [
+        ("on wed,thu at 19:00", Some("Pre-lock lineup check")),
+        ("on sat at 09:00", None),
+        ("on sun at 11:30", Some("Final lineup before kickoff")),
+    ] {
+        let note = note.map(str::to_string);
+        schedule::apply(&mut ff, schedule::parse(r, now).unwrap(), note, now);
     }
+    ff.next_run = Some(now + 3 * 3600);
+    ff.note = Some("Verify the waiver claims went through".into());
     s.bots.insert("fantasy-football".into(), ff);
     s.bots
         .insert("weekly-review".into(), bot("Weekly review", None, None));
@@ -1902,6 +2166,17 @@ fn main() {
             ("weekly", |s: &mut App| {
                 demo(s);
                 s.selected = Some("fantasy-football".into());
+                s.tab = Tab::Schedule;
+                s.sched.kind = 1;
+                s.sched.days = [false, false, false, false, false, true, true];
+                s.sched.time = "10:00".into();
+            }),
+            ("schedule-once", |s: &mut App| {
+                demo(s);
+                s.tab = Tab::Schedule;
+                s.time_combo.step(rune_kit::ComboboxEvent::Toggle {
+                    current: Some("09:00"),
+                });
             }),
             ("default-model", |s: &mut App| {
                 demo(s);

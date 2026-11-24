@@ -25,19 +25,25 @@ pub struct Bot {
     /// Overrides the app's default model.
     #[serde(default)]
     pub model: Option<ModelRef>,
-    /// A one-off wake-up, or the next tick of `every`, in Unix seconds.
+    /// A one-off wake-up, in Unix seconds.
     #[serde(default)]
     pub next_run: Option<i64>,
-    /// After each scheduled wake-up, wake again this many seconds later.
+    /// An interval: wake every this many seconds.
     #[serde(default)]
     pub every: Option<i64>,
+    /// The interval's next tick.
+    #[serde(default)]
+    pub every_next: Option<i64>,
+    /// The interval's note.
+    #[serde(default)]
+    pub every_note: Option<String>,
     /// Weekly wake-ups (`on wed,thu at 19:00`).
     #[serde(default)]
     pub rules: Vec<Rule>,
     /// The last scheduled wake-up (or when the rules last changed): rules fire for times after it.
     #[serde(default)]
     pub last_wake: Option<i64>,
-    /// The note for the one-off (or interval) wake-up: what that run should do.
+    /// The one-off wake-up's note: what that run should do.
     #[serde(default)]
     pub note: Option<String>,
     /// Oldest first.
@@ -107,7 +113,14 @@ pub fn list() -> BTreeMap<String, Bot> {
 
 pub fn load(slug: &str) -> Result<Bot> {
     let raw = std::fs::read(config_path(slug)).with_context(|| format!("no bot {slug:?}"))?;
-    serde_json::from_slice(&raw).with_context(|| format!("read {slug}/bot.json"))
+    let mut bot: Bot =
+        serde_json::from_slice(&raw).with_context(|| format!("read {slug}/bot.json"))?;
+    // Before intervals had their own fields, `next_run` held the interval's next tick.
+    if bot.every.is_some() && bot.every_next.is_none() {
+        bot.every_next = bot.next_run.take().or(Some(now()));
+        bot.every_note = bot.note.take();
+    }
+    Ok(bot)
 }
 
 pub fn save(slug: &str, bot: &Bot) -> Result<()> {
