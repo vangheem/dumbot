@@ -245,17 +245,12 @@ impl App {
             .collect();
         for slug in due {
             // Take the wake-up off the schedule first, so it can't fire twice.
-            let res = bots::update(&slug, |b| {
-                schedule::fired(b, now);
-            });
+            let mut notes = Vec::new();
+            let res = bots::update(&slug, |b| notes = schedule::fired(b, now));
             match res {
                 Ok(bot) => {
-                    let reason = match &bot.note {
-                        Some(n) => format!("scheduled wake-up ({n})"),
-                        None => "scheduled wake-up".into(),
-                    };
                     self.bots.insert(slug.clone(), bot);
-                    self.start_run(slug, reason, None);
+                    self.start_run(slug, "scheduled wake-up".into(), notes, None);
                 }
                 Err(e) => self.notify(format!("Couldn't wake {slug}: {e:#}"), true),
             }
@@ -263,7 +258,13 @@ impl App {
     }
 
     /// Starts a new run of a bot in a fresh session, with `message` from the user if any.
-    fn start_run(&mut self, slug: String, reason: String, message: Option<String>) {
+    fn start_run(
+        &mut self,
+        slug: String,
+        reason: String,
+        notes: Vec<String>,
+        message: Option<String>,
+    ) {
         let Some(bot) = self.bots.get(&slug).cloned() else {
             return;
         };
@@ -277,7 +278,7 @@ impl App {
                     Some(c) => c,
                     None => Client::connect()?,
                 };
-                bots::start_run(&oc, &s2, &bot, &reason, message.as_deref(), default)
+                bots::start_run(&oc, &s2, &bot, &reason, &notes, message.as_deref(), default)
             },
             move |s, res, tx| {
                 s.starting.remove(&slug);
@@ -304,6 +305,7 @@ impl App {
             self.start_run(
                 slug,
                 "started by the user".into(),
+                Vec::new(),
                 (!msg.is_empty()).then_some(msg),
             );
         }
@@ -446,6 +448,7 @@ impl App {
                      do the job, rewrite AGENTS.md to match, do a first pass of the work if it \
                      makes sense, and schedule your next run."
                         .into(),
+                    Vec::new(),
                     None,
                 );
             }
@@ -1681,7 +1684,7 @@ mod live_tests {
         unsafe { std::env::set_var("XDG_DATA_HOME", &tmp) };
         let slug = bots::create("Live test", "Do nothing.").unwrap();
         assert!(bots::list().contains_key(&slug));
-        assert!(bots::preamble(&bots::load(&slug).unwrap(), "test").starts_with(bots::RUN_PREFIX));
+        assert!(bots::preamble("test", &[]).starts_with(bots::RUN_PREFIX));
         bots::prepare(&slug, &bots::load(&slug).unwrap()).unwrap();
         assert!(bots::dir(&slug).join(".git").exists());
         assert_eq!(bots::files(&slug)[0].0, "AGENTS.md");

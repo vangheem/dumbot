@@ -86,8 +86,9 @@ the user, out of context, the app closed), and whatever you haven't written down
    weekdays, weekends, daily; several times: `at 10:00,18:00`), and rules add up, so run it
    once per rule for different days at different times; `off` clears everything. Rules and
    intervals keep going on their own: set them once, and on later runs only add a one-off when
-   something needs an earlier or extra look. Add --note "what to do next time" to leave your
-   next run a note. `{exe} list` shows your schedule. Pick times that are actually useful;
+   something needs an earlier or extra look. Add --note "what to do then" to any of
+   them: the note belongs to that rule or wake-up, and the run it wakes gets it.
+   `{exe} list` shows each wake-up with its note. Pick times that are actually useful;
    don't wake just to find nothing to do. Keep your schedule written in AGENTS.md too.
 6. End with a short summary for the user: what you did, how you changed, what you need from
    them (if anything), and when you'll run next.

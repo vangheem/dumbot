@@ -131,22 +131,35 @@ fn weekly(s: &str) -> Result<Vec<Rule>> {
             Ok(Rule {
                 days: picked.clone(),
                 time: t.format("%H:%M").to_string(),
+                note: None,
             })
         })
         .collect()
 }
 
+/// `note` goes with what's scheduled: the rules being added, or the one-off or interval.
+/// Adding a rule that exists (same days and time) replaces its note.
 pub fn apply(bot: &mut Bot, schedule: Schedule, note: Option<String>, now: i64) {
     match schedule {
-        Schedule::At(t) => bot.next_run = Some(t),
+        Schedule::At(t) => {
+            bot.next_run = Some(t);
+            bot.note = note;
+        }
         Schedule::Every(secs) => {
             bot.next_run = Some(now + secs);
             bot.every = Some(secs);
+            bot.note = note;
         }
         Schedule::Weekly(rules) => {
-            for r in rules {
-                if !bot.rules.contains(&r) {
-                    bot.rules.push(r);
+            for mut r in rules {
+                r.note = note.clone();
+                match bot
+                    .rules
+                    .iter_mut()
+                    .find(|x| x.days == r.days && x.time == r.time)
+                {
+                    Some(x) => x.note = r.note,
+                    None => bot.rules.push(r),
                 }
             }
             // Only times from now on: a new rule doesn't fire for earlier ones.
@@ -156,10 +169,8 @@ pub fn apply(bot: &mut Bot, schedule: Schedule, note: Option<String>, now: i64) 
             bot.next_run = None;
             bot.every = None;
             bot.rules.clear();
+            bot.note = None;
         }
-    }
-    if note.is_some() {
-        bot.note = note;
     }
 }
 
@@ -190,13 +201,48 @@ fn rule_next(r: &Rule, after: i64) -> Option<i64> {
         .find(|t| *t > after)
 }
 
-/// Records a scheduled wake-up at `now`: rules move on to their next times, and a one-off (or
-/// interval tick) that was due is used up, the interval scheduling its next tick.
-pub fn fired(bot: &mut Bot, now: i64) {
+/// Records a scheduled wake-up at `now`, returning the notes of what fired: rules move on to
+/// their next times, and a one-off (or interval tick) that was due is used up, the interval
+/// scheduling its next tick.
+pub fn fired(bot: &mut Bot, now: i64) -> Vec<String> {
+    let after = bot.last_wake.unwrap_or(now);
+    let mut notes: Vec<String> = bot
+        .rules
+        .iter()
+        .filter(|r| rule_next(r, after).is_some_and(|t| t <= now))
+        .filter_map(|r| Some(format!("{}: {}", rule(r), r.note.as_ref()?)))
+        .collect();
     bot.last_wake = Some(now);
     if bot.next_run.is_some_and(|t| t <= now) {
         bot.next_run = bot.every.map(|e| now + e);
+        let note = if bot.every.is_some() {
+            bot.note.clone()
+        } else {
+            bot.note.take()
+        };
+        notes.extend(note);
     }
+    notes
+}
+
+/// Each wake-up and its note, one per line, for `dumbot list`.
+pub fn details(bot: &Bot, now: i64) -> Vec<String> {
+    let note = |n: &Option<String>| n.as_ref().map_or(String::new(), |n| format!(": {n}"));
+    let mut out = Vec::new();
+    match (bot.next_run, bot.every) {
+        (Some(t), None) => out.push(format!("once {}{}", when(t, now), note(&bot.note))),
+        (Some(t), Some(e)) => out.push(format!(
+            "every {}, next {}{}",
+            span(e),
+            when(t, now),
+            note(&bot.note)
+        )),
+        _ => {}
+    }
+    for r in &bot.rules {
+        out.push(format!("{}{}", rule(r), note(&r.note)));
+    }
+    out
 }
 
 /// `Wed, Thu 19:00`, `Weekdays 08:30`, `Daily 07:00`.
@@ -264,8 +310,12 @@ pub fn next_line(bot: &Bot, now: i64) -> String {
 /// A bot's whole schedule: `Next: Today 14:30 · every 2h · Wed, Thu 19:00`.
 pub fn describe(bot: &Bot, now: i64) -> String {
     let mut out = next_line(bot, now);
-    if let Some(e) = bot.every {
-        out.push_str(&format!(" · every {}", span(e)));
+    match (bot.next_run, bot.every) {
+        (Some(t), None) if Some(t) != next(bot, now) => {
+            out.push_str(&format!(" · once {}", when(t, now)))
+        }
+        (_, Some(e)) => out.push_str(&format!(" · every {}", span(e))),
+        _ => {}
     }
     for r in &bot.rules {
         out.push_str(&format!(" · {}", rule(r)));
@@ -320,7 +370,7 @@ mod tests {
         assert_eq!(next(&bot, now), Some(local("2026-11-25 19:00")));
         let wed = local("2026-11-25 19:00");
         assert!(bot.due(wed));
-        fired(&mut bot, wed);
+        assert!(fired(&mut bot, wed).is_empty());
         assert_eq!(next(&bot, wed), Some(local("2026-11-26 19:00")));
         fired(&mut bot, local("2026-11-26 19:00"));
         assert_eq!(next(&bot, wed), Some(local("2026-11-28 10:00")));
@@ -330,10 +380,33 @@ mod tests {
         fired(&mut bot, monday);
         assert_eq!(next(&bot, monday), Some(local("2026-12-02 19:00")));
         // A one-off sooner than the rules wins, and is used up when it fires.
-        apply(&mut bot, parse("in 2h", monday).unwrap(), None, monday);
+        apply(
+            &mut bot,
+            parse("in 2h", monday).unwrap(),
+            Some("extra look".into()),
+            monday,
+        );
         assert_eq!(next(&bot, monday), Some(monday + 7200));
-        fired(&mut bot, monday + 7200);
-        assert_eq!(bot.next_run, None);
+        assert_eq!(fired(&mut bot, monday + 7200), ["extra look"]);
+        assert_eq!((bot.next_run, bot.note.as_ref()), (None, None));
+        // Each rule keeps its own note, and a wake-up gets the notes of what fired.
+        let note = |n: &str| Some(n.to_string());
+        apply(
+            &mut bot,
+            parse("on wed at 19:00", monday).unwrap(),
+            note("lineup"),
+            monday,
+        );
+        apply(
+            &mut bot,
+            parse("on sat at 10:00", monday).unwrap(),
+            note("waivers"),
+            monday,
+        );
+        assert_eq!(
+            fired(&mut bot, local("2026-12-02 19:00")),
+            ["Wed 19:00: lineup"]
+        );
         apply(&mut bot, Schedule::Off, None, monday);
         assert_eq!(next(&bot, monday), None);
     }

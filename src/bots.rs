@@ -37,7 +37,7 @@ pub struct Bot {
     /// The last scheduled wake-up (or when the rules last changed): rules fire for times after it.
     #[serde(default)]
     pub last_wake: Option<i64>,
-    /// What the bot asked its next run to do.
+    /// The note for the one-off (or interval) wake-up: what that run should do.
     #[serde(default)]
     pub note: Option<String>,
     /// Oldest first.
@@ -52,6 +52,9 @@ pub struct Rule {
     pub days: Vec<u8>,
     /// `HH:MM`, local time.
     pub time: String,
+    /// What runs woken by this rule should do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -117,7 +120,12 @@ pub fn save(slug: &str, bot: &Bot) -> Result<()> {
 
 /// Re-reads the bot, changes it and writes it back, so changes made meanwhile by
 /// `dumbot wake` (from a bot's run) aren't lost.
+///
+/// Holds a lock on the bot meanwhile: a bot may run several `dumbot wake`s at once.
 pub fn update(slug: &str, f: impl FnOnce(&mut Bot)) -> Result<Bot> {
+    let lock = std::fs::File::create(dir(slug).join("bot.json.lock"))
+        .with_context(|| format!("no bot {slug:?}"))?;
+    lock.lock()?;
     let mut bot = load(slug)?;
     f(&mut bot);
     save(slug, &bot)?;
@@ -278,14 +286,15 @@ fn exe() -> String {
         .unwrap_or_else(|_| "dumbot".into())
 }
 
-/// The first prompt of a run: why it's running, the note its last run left, and the time.
-/// Its first line is shown in place of the whole thing.
-pub fn preamble(bot: &Bot, reason: &str) -> String {
-    let note = bot
-        .note
-        .as_ref()
-        .map(|n| format!("\nYour last run left you this note: {n}\n"))
-        .unwrap_or_default();
+/// The first prompt of a run: why it's running, the notes left for the wake-ups that woke
+/// it, and the time. Its first line is shown in place of the whole thing.
+pub fn preamble(reason: &str, notes: &[String]) -> String {
+    let note = if notes.is_empty() {
+        String::new()
+    } else {
+        let list: Vec<String> = notes.iter().map(|n| format!("- {n}")).collect();
+        format!("\nNotes you left for this run:\n{}\n", list.join("\n"))
+    };
     let now = chrono::Local::now().format("%A %Y-%m-%d %H:%M %Z");
     format!("{RUN_PREFIX}{reason}\n{note}\nIt is now {now}. Begin your run.")
 }
@@ -297,10 +306,12 @@ pub fn start_run(
     slug: &str,
     bot: &Bot,
     reason: &str,
+    notes: &[String],
     message: Option<&str>,
     default: Option<ModelRef>,
 ) -> Result<String> {
     prepare(slug, bot)?;
+    oc.await_agent(&dir(slug), AGENT)?;
     let model = bot.model.clone().or(default);
     let title = format!("{}: {reason}", bot.name);
     let id = oc.create_session(&title, &dir(slug), AGENT, model.as_ref())?;
@@ -312,9 +323,7 @@ pub fn start_run(
             reason: reason.into(),
         },
     )?;
-    // The note was for this run; it's read now.
-    update(slug, |b| b.note = None)?;
-    let mut text = preamble(bot, reason);
+    let mut text = preamble(reason, notes);
     if let Some(m) = message {
         text = format!("{text}\n\n{MESSAGE_MARK}{m}");
     }

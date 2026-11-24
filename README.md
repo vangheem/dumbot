@@ -46,11 +46,13 @@ dumbot wake <bot> every 6h --note "check the PR queue first"
 dumbot wake <bot> on wed,thu at 19:00        # weekly rules add up: mon..sun, weekdays,
 dumbot wake <bot> on sat,sun at 10:00,18:00  #   weekends, daily; several times per rule
 dumbot wake <bot> off                        # clears everything
+dumbot list                                  # every wake-up and its note
 dumbot list
 dumbot run <bot> [message]                   # start a run now, from a script or cron
 ```
 
-A bot wakes at the earliest of its one-off, interval and weekly times. `dumbot wake` writes
+A bot wakes at the earliest of its one-off, interval and weekly times. A `--note` belongs to
+the rule or wake-up it was given with, and the run that wakes gets the notes of what fired. `dumbot wake` writes
 `bot.json`; the running app re-reads bots every few seconds and starts the ones that are due.
 A bot whose last run is still working (or waiting on its subagents) waits for it to finish.
 Bots only wake while the app is running; times missed while it was closed run once when it

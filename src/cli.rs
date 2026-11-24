@@ -76,6 +76,7 @@ fn run_bot(args: &[String]) -> Result<()> {
         &slug,
         &b,
         "started from the command line",
+        &[],
         message.as_deref(),
         store::Store::load().model,
     )?;
@@ -86,7 +87,10 @@ fn run_bot(args: &[String]) -> Result<()> {
 fn list() -> Result<()> {
     let now = bots::now();
     for (slug, b) in bots::list() {
-        println!("{slug}\t{}", schedule::describe(&b, now));
+        println!("{slug}\t{}", schedule::next_line(&b, now));
+        for line in schedule::details(&b, now) {
+            println!("    {line}");
+        }
     }
     Ok(())
 }

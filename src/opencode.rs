@@ -184,6 +184,31 @@ impl Client {
             .ok_or_else(|| anyhow!("session create returned no id"))
     }
 
+    /// Waits (a few seconds at most) until opencode sees `dir` as its own project with
+    /// `agent` in it. A folder opencode first saw before it was a git repository stays in
+    /// opencode's "global" project for a moment, where the folder's agents don't exist.
+    pub fn await_agent(&self, dir: &Path, agent: &str) -> Result<()> {
+        let dir_q = format!(
+            "location%5Bdirectory%5D={}",
+            urlencode(&dir.display().to_string())
+        );
+        for _ in 0..20 {
+            let ok = self.get(&format!("/api/agent?{dir_q}")).is_ok_and(|v| {
+                v["data"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|x| x["id"] == agent))
+            });
+            if ok {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        Err(anyhow!(
+            "opencode doesn't see the {agent} agent in {}",
+            dir.display()
+        ))
+    }
+
     pub fn set_model(&self, id: &str, m: &ModelRef) -> Result<()> {
         self.post(
             &format!("/api/session/{id}/model"),
@@ -294,6 +319,17 @@ impl Client {
                 .unwrap_or_default(),
         })
     }
+}
+
+fn urlencode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 fn map_err(r: Result<ureq::Response, ureq::Error>) -> Result<ureq::Response> {
