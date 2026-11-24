@@ -1,9 +1,12 @@
-//! When bots wake: parsing `in 2h`, `at 09:00`, `every 6h`, `off`, and describing schedules.
+//! When bots wake. A bot can have, all at once: a one-off wake-up (`in 2h`, `at 09:00`), an
+//! interval (`every 6h`) and weekly rules (`on wed,thu at 19:00`). It wakes at the earliest.
 
 use anyhow::{Result, anyhow};
-use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
+use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 
-use crate::bots::Bot;
+use crate::bots::{Bot, Rule};
+
+const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Schedule {
@@ -11,10 +14,13 @@ pub enum Schedule {
     At(i64),
     /// Every this many seconds, first one from now.
     Every(i64),
+    /// Weekly rules to add.
+    Weekly(Vec<Rule>),
     Off,
 }
 
-/// `now`, `in 30m`, `in 1h30m`, `at 09:00`, `at 2026-12-01 09:00`, `every 6h`, `off`.
+/// `now`, `in 30m`, `in 1h30m`, `at 09:00`, `at 2026-12-01 09:00`, `every 6h`,
+/// `on wed,thu at 19:00`, `on weekends at 10:00,18:00`, `off`.
 pub fn parse(input: &str, now: i64) -> Result<Schedule> {
     let s = input.trim().to_lowercase();
     let (word, rest) = s.split_once(char::is_whitespace).unwrap_or((&s, ""));
@@ -25,8 +31,10 @@ pub fn parse(input: &str, now: i64) -> Result<Schedule> {
         "in" => Ok(Schedule::At(now + duration(rest)?)),
         "every" => Ok(Schedule::Every(duration(rest)?)),
         "at" => Ok(Schedule::At(at(rest, now)?)),
+        "on" => Ok(Schedule::Weekly(weekly(rest)?)),
         _ => Err(anyhow!(
-            "can't read {input:?}: use now, in 30m, at 09:00, at 2026-12-01 09:00, every 6h or off"
+            "can't read {input:?}: use now, in 30m, at 09:00, at 2026-12-01 09:00, every 6h, \
+             on wed,thu at 19:00, or off"
         )),
     }
 }
@@ -89,24 +97,126 @@ fn at(s: &str, now: i64) -> Result<i64> {
     }
 }
 
+/// `wed,thu at 19:00`, `sat sun at 10:00,18:00`, `weekdays at 08:30`, `daily at 07:00`: one
+/// rule per time.
+fn weekly(s: &str) -> Result<Vec<Rule>> {
+    let bad = || anyhow!("can't read {s:?}: use e.g. on wed,thu at 19:00 or on weekends at 10:00");
+    let (days, times) = s.split_once(" at ").ok_or_else(bad)?;
+    let mut picked = Vec::new();
+    for word in days.split([',', ' ']).filter(|w| !w.is_empty()) {
+        let add: Vec<u8> = match word {
+            "daily" | "everyday" => (0..7).collect(),
+            "weekdays" => (0..5).collect(),
+            "weekends" => vec![5, 6],
+            w => {
+                let i = DAYS
+                    .iter()
+                    .position(|d| w.len() >= 3 && d.starts_with(&w[..3]))
+                    .ok_or_else(bad)?;
+                vec![i as u8]
+            }
+        };
+        picked.extend(add);
+    }
+    picked.sort();
+    picked.dedup();
+    if picked.is_empty() {
+        return Err(bad());
+    }
+    times
+        .split([',', ' '])
+        .filter(|t| !t.is_empty())
+        .map(|t| {
+            let t = NaiveTime::parse_from_str(t, "%H:%M").map_err(|_| bad())?;
+            Ok(Rule {
+                days: picked.clone(),
+                time: t.format("%H:%M").to_string(),
+            })
+        })
+        .collect()
+}
+
 pub fn apply(bot: &mut Bot, schedule: Schedule, note: Option<String>, now: i64) {
     match schedule {
-        Schedule::At(t) => {
-            bot.next_run = Some(t);
-            bot.every = None;
-        }
+        Schedule::At(t) => bot.next_run = Some(t),
         Schedule::Every(secs) => {
             bot.next_run = Some(now + secs);
             bot.every = Some(secs);
         }
+        Schedule::Weekly(rules) => {
+            for r in rules {
+                if !bot.rules.contains(&r) {
+                    bot.rules.push(r);
+                }
+            }
+            // Only times from now on: a new rule doesn't fire for earlier ones.
+            bot.last_wake = Some(now);
+        }
         Schedule::Off => {
             bot.next_run = None;
             bot.every = None;
+            bot.rules.clear();
         }
     }
     if note.is_some() {
         bot.note = note;
     }
+}
+
+/// When the bot next wakes: the earliest of its one-off or interval time and its rules' next
+/// times after its last wake-up. A rule time missed while the app was closed is in the past,
+/// so it's due now (once, however many were missed).
+pub fn next(bot: &Bot, now: i64) -> Option<i64> {
+    let after = bot.last_wake.unwrap_or(now);
+    bot.rules
+        .iter()
+        .filter_map(|r| rule_next(r, after))
+        .chain(bot.next_run)
+        .min()
+}
+
+/// A rule's first time after `after`.
+fn rule_next(r: &Rule, after: i64) -> Option<i64> {
+    let time = NaiveTime::parse_from_str(&r.time, "%H:%M").ok()?;
+    let start = Local.timestamp_opt(after, 0).single()?.date_naive();
+    (0..=7)
+        .map(|d| start + Duration::days(d))
+        .filter(|day| {
+            r.days
+                .contains(&(day.weekday().num_days_from_monday() as u8))
+        })
+        .filter_map(|day| Local.from_local_datetime(&day.and_time(time)).earliest())
+        .map(|t| t.timestamp())
+        .find(|t| *t > after)
+}
+
+/// Records a scheduled wake-up at `now`: rules move on to their next times, and a one-off (or
+/// interval tick) that was due is used up, the interval scheduling its next tick.
+pub fn fired(bot: &mut Bot, now: i64) {
+    bot.last_wake = Some(now);
+    if bot.next_run.is_some_and(|t| t <= now) {
+        bot.next_run = bot.every.map(|e| now + e);
+    }
+}
+
+/// `Wed, Thu 19:00`, `Weekdays 08:30`, `Daily 07:00`.
+pub fn rule(r: &Rule) -> String {
+    let days = match r.days.as_slice() {
+        [0, 1, 2, 3, 4, 5, 6] => "Daily".to_string(),
+        [0, 1, 2, 3, 4] => "Weekdays".to_string(),
+        [5, 6] => "Weekends".to_string(),
+        d => d
+            .iter()
+            .filter_map(|i| DAYS.get(*i as usize))
+            .map(|n| {
+                let mut c = n.chars();
+                c.next()
+                    .map_or(String::new(), |f| f.to_uppercase().chain(c).collect())
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
+    format!("{days} {}", r.time)
 }
 
 /// `Today 14:30`, `Tomorrow 09:00`, `Mon Dec 1 09:00`.
@@ -142,14 +252,25 @@ pub fn span(secs: i64) -> String {
     }
 }
 
-/// A bot's schedule in a few words: `Next: Today 14:30 · every 2h`.
-pub fn describe(bot: &Bot, now: i64) -> String {
-    match (bot.next_run, bot.every) {
-        (None, _) => "Not scheduled".into(),
-        (Some(t), _) if t <= now => "Due now".into(),
-        (Some(t), None) => format!("Next: {}", when(t, now)),
-        (Some(t), Some(e)) => format!("Next: {} · every {}", when(t, now), span(e)),
+/// When the bot wakes next: `Next: Today 14:30`, `Due now`, `Not scheduled`.
+pub fn next_line(bot: &Bot, now: i64) -> String {
+    match next(bot, now) {
+        None => "Not scheduled".into(),
+        Some(t) if t <= now => "Due now".into(),
+        Some(t) => format!("Next: {}", when(t, now)),
     }
+}
+
+/// A bot's whole schedule: `Next: Today 14:30 · every 2h · Wed, Thu 19:00`.
+pub fn describe(bot: &Bot, now: i64) -> String {
+    let mut out = next_line(bot, now);
+    if let Some(e) = bot.every {
+        out.push_str(&format!(" · every {}", span(e)));
+    }
+    for r in &bot.rules {
+        out.push_str(&format!(" · {}", rule(r)));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -171,5 +292,49 @@ mod tests {
         assert!(parse("in 5 minutes", now).is_err());
         assert!(parse("in 0m", now).is_err());
         assert!(parse("tomorrow", now).is_err());
+        let Schedule::Weekly(rules) = parse("on wed, Thursday at 19:00,21:30", now).unwrap() else {
+            panic!()
+        };
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rule(&rules[0]), "Wed, Thu 19:00");
+        assert!(parse("on someday at 19:00", now).is_err());
+        assert!(parse("on wed at 7pm", now).is_err());
+    }
+
+    /// Wed/Thu evenings plus weekend mornings: wakes at each in turn, and a time missed while
+    /// the app was closed is due once.
+    #[test]
+    fn weekly_rules_wake_in_turn() {
+        let local = |s: &str| {
+            Local
+                .from_local_datetime(&NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M").unwrap())
+                .unwrap()
+                .timestamp()
+        };
+        // 2026-11-23 is a Monday.
+        let mut bot = Bot::default();
+        let now = local("2026-11-23 12:00");
+        for s in ["on wed,thu at 19:00", "on sat,sun at 10:00"] {
+            apply(&mut bot, parse(s, now).unwrap(), None, now);
+        }
+        assert_eq!(next(&bot, now), Some(local("2026-11-25 19:00")));
+        let wed = local("2026-11-25 19:00");
+        assert!(bot.due(wed));
+        fired(&mut bot, wed);
+        assert_eq!(next(&bot, wed), Some(local("2026-11-26 19:00")));
+        fired(&mut bot, local("2026-11-26 19:00"));
+        assert_eq!(next(&bot, wed), Some(local("2026-11-28 10:00")));
+        // Closed all weekend: Saturday's and Sunday's are missed, and it's due once on Monday.
+        let monday = local("2026-11-30 09:00");
+        assert!(bot.due(monday));
+        fired(&mut bot, monday);
+        assert_eq!(next(&bot, monday), Some(local("2026-12-02 19:00")));
+        // A one-off sooner than the rules wins, and is used up when it fires.
+        apply(&mut bot, parse("in 2h", monday).unwrap(), None, monday);
+        assert_eq!(next(&bot, monday), Some(monday + 7200));
+        fired(&mut bot, monday + 7200);
+        assert_eq!(bot.next_run, None);
+        apply(&mut bot, Schedule::Off, None, monday);
+        assert_eq!(next(&bot, monday), None);
     }
 }

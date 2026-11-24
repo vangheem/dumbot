@@ -246,7 +246,7 @@ impl App {
         for slug in due {
             // Take the wake-up off the schedule first, so it can't fire twice.
             let res = bots::update(&slug, |b| {
-                b.next_run = b.every.map(|e| now + e);
+                schedule::fired(b, now);
             });
             match res {
                 Ok(bot) => {
@@ -816,7 +816,7 @@ fn sidebar(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
         } else if s.is_running(bot) {
             "Running…".to_string()
         } else {
-            schedule::describe(bot, now)
+            schedule::next_line(bot, now)
         };
         let open = slug.clone();
         rows.push(
@@ -1420,7 +1420,7 @@ fn dialogs(s: &App, k: &Kit, layer: &mut Vec<El>) {
     }
     if let Some((when, note)) = &s.schedule_edit {
         let when = TextInput::new(when)
-            .placeholder("in 2h · at 09:00 · every 6h · off")
+            .placeholder("in 2h · at 09:00 · every 6h · on wed,thu at 19:00 · off")
             .width(None)
             .on_edit(|s: &mut App| &mut s.schedule_edit.as_mut().expect("dialog open").0)
             .on_submit(|s: &mut App, _| s.save_schedule())
@@ -1578,10 +1578,11 @@ fn demo(s: &mut App) {
         reason: "scheduled wake-up".into(),
     }];
     s.bots.insert("inbox-triager".into(), inbox);
-    s.bots.insert(
-        "price-watch".into(),
-        bot("Price watch", Some(now + 86400), None),
-    );
+    let mut ff = bot("Fantasy football", None, None);
+    for r in ["on wed,thu at 19:00", "on sat at 09:00", "on sun at 11:30"] {
+        schedule::apply(&mut ff, schedule::parse(r, now).unwrap(), None, now);
+    }
+    s.bots.insert("fantasy-football".into(), ff);
     s.bots
         .insert("weekly-review".into(), bot("Weekly review", None, None));
     s.selected = Some("inbox-triager".into());
@@ -1639,6 +1640,10 @@ fn main() {
                 s.new_bot = Some(new_bot_edits());
             }),
             ("empty", |_: &mut App| {}),
+            ("weekly", |s: &mut App| {
+                demo(s);
+                s.selected = Some("fantasy-football".into());
+            }),
             ("default-model", |s: &mut App| {
                 demo(s);
                 s.default_combo

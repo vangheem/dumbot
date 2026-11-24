@@ -30,7 +30,9 @@ const USAGE: &str = "dumBot: bots that rewrite themselves, run through opencode.
   dumbot list                    list bots and when they wake
   dumbot run <bot> [message]     start a run now and print its session id
   dumbot wake <bot> <when> [--note TEXT]
-        <when>: now | in 30m | in 1h30m | at 09:00 | at 2026-12-01 09:00 | every 6h | off
+        <when>: now | in 30m | in 1h30m | at 09:00 | at 2026-12-01 09:00 | every 6h
+                | on wed,thu at 19:00 | on weekends at 10:00,18:00 | off
+        Weekly rules add up; in/at add a one-off wake-up; off clears everything.
   dumbot install-app             add dumbot.app to ~/Applications (macOS)
   dumbot uninstall-app";
 

@@ -64,20 +64,26 @@ pub struct Usage {
     pub cost: f64,
 }
 
-fn usage(info: &Value) -> Usage {
+/// `messages` newest first. A session that was never given a model has none of its own, so
+/// its newest reply's model shows what it's actually using.
+fn usage(info: &Value, messages: &Value) -> Usage {
     let t = &info["tokens"];
     let n = |v: &Value| v.as_u64().unwrap_or(0);
+    let model_ref = |m: &Value| match (m["providerID"].as_str(), m["id"].as_str()) {
+        (Some(provider), Some(id)) => Some(ModelRef {
+            provider: provider.into(),
+            id: id.into(),
+        }),
+        _ => None,
+    };
+    let replied = messages
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| m["type"] == "assistant")
+        .find_map(|m| model_ref(&m["model"]));
     Usage {
-        model: match (
-            info["model"]["providerID"].as_str(),
-            info["model"]["id"].as_str(),
-        ) {
-            (Some(provider), Some(id)) => Some(ModelRef {
-                provider: provider.into(),
-                id: id.into(),
-            }),
-            _ => None,
-        },
+        model: model_ref(&info["model"]).or(replied),
         input: n(&t["input"]),
         output: n(&t["output"]),
         reasoning: n(&t["reasoning"]),
@@ -231,18 +237,30 @@ impl Client {
         Ok(())
     }
 
-    /// Ids of the sessions the agent is working in right now.
+    /// Ids of the sessions being worked in right now, counting a session as working while
+    /// any of its subagents are (it goes idle while it waits for their reports).
     pub fn active_sessions(&self) -> Result<std::collections::HashSet<String>> {
         let v = self.get("/api/session/active")?;
-        Ok(v["data"]
+        let mut out: std::collections::HashSet<String> = v["data"]
             .as_object()
             .map(|m| m.keys().cloned().collect())
-            .unwrap_or_default())
+            .unwrap_or_default();
+        for id in out.clone() {
+            let mut at = id;
+            // Up through parents: a subagent's own subagent keeps the run working too.
+            while let Ok(info) = self.get(&format!("/api/session/{at}")) {
+                match info["data"]["parentID"].as_str() {
+                    Some(parent) if out.insert(parent.to_string()) => at = parent.to_string(),
+                    _ => break,
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn snapshot(&self, id: &str) -> Result<Snapshot> {
         let messages = self.get(&format!("/api/session/{id}/message?order=desc&limit=200"))?;
-        let active = self.get("/api/session/active")?;
+        let active = self.active_sessions()?;
         let info = self.get(&format!("/api/session/{id}"))?;
         let permissions = self
             .get(&format!("/api/session/{id}/permission"))
@@ -252,8 +270,8 @@ impl Client {
                 .as_array()
                 .map(|m| m.iter().rev().flat_map(entries).collect())
                 .unwrap_or_default(),
-            running: active["data"].get(id).is_some(),
-            usage: usage(&info["data"]),
+            running: active.contains(id),
+            usage: usage(&info["data"], &messages["data"]),
             permissions: permissions["data"]
                 .as_array()
                 .map(|p| {
