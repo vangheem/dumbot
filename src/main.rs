@@ -4,6 +4,7 @@
 mod appbundle;
 mod bots;
 mod cli;
+mod env;
 mod opencode;
 mod schedule;
 mod store;
@@ -38,6 +39,28 @@ enum Confirm {
     InstallApp,
     Update,
     Delete(String),
+}
+
+/// The environment variables dialog: global (`bot` none) or one bot's. Values are typed in
+/// and never shown again.
+struct EnvEdit {
+    bot: Option<String>,
+    env: env::Env,
+    name: TextEdit,
+    value: TextEdit,
+}
+
+impl EnvEdit {
+    fn open(bot: Option<String>) -> EnvEdit {
+        let mut name = TextEdit::new("");
+        name.focused = true;
+        EnvEdit {
+            bot,
+            env: env::load(),
+            name,
+            value: TextEdit::new(""),
+        }
+    }
 }
 
 struct App {
@@ -75,6 +98,9 @@ struct App {
     confirm: Option<Confirm>,
     new_bot: Option<(TextEdit, TextEdit)>,
     schedule_edit: Option<(TextEdit, TextEdit)>,
+    /// The instructions for all bots, being edited.
+    instructions: Option<TextEdit>,
+    env_edit: Option<EnvEdit>,
     toast: Option<(String, bool)>,
     toast_until: Option<f64>,
     update: Option<String>,
@@ -115,6 +141,8 @@ fn init() -> App {
         confirm: None,
         new_bot: None,
         schedule_edit: None,
+        instructions: None,
+        env_edit: None,
         toast: None,
         toast_until: None,
         update: None,
@@ -474,6 +502,59 @@ impl App {
         }
     }
 
+    fn save_instructions(&mut self) {
+        let Some(t) = self.instructions.take() else {
+            return;
+        };
+        match store::save_instructions(&t.text) {
+            Ok(()) => self.notify("Saved. Bots follow it from their next run.", false),
+            Err(e) => self.notify(format!("Couldn't save: {e:#}"), true),
+        }
+    }
+
+    fn add_env(&mut self) {
+        let Some(e) = &mut self.env_edit else { return };
+        let name = e.name.text.trim().to_string();
+        if !env::valid_name(&name) {
+            return self.notify(
+                "Names use letters, digits and underscores, and don't start with a digit.",
+                true,
+            );
+        }
+        if e.value.text.is_empty() {
+            return self.notify("Enter a value.", true);
+        }
+        let mut fresh = env::load();
+        fresh
+            .scope(e.bot.as_deref())
+            .insert(name, e.value.text.clone());
+        self.save_env(fresh);
+    }
+
+    fn remove_env(&mut self, name: &str) {
+        let Some(e) = &self.env_edit else { return };
+        let mut fresh = env::load();
+        fresh.scope(e.bot.as_deref()).remove(name);
+        if let Some(b) = &e.bot
+            && fresh.bots.get(b).is_some_and(|v| v.is_empty())
+        {
+            fresh.bots.remove(b);
+        }
+        self.save_env(fresh);
+    }
+
+    fn save_env(&mut self, fresh: env::Env) {
+        if let Err(err) = fresh.save() {
+            return self.notify(format!("Couldn't save: {err:#}"), true);
+        }
+        if let Some(e) = &mut self.env_edit {
+            e.env = fresh;
+            e.name = TextEdit::new("");
+            e.name.focused = true;
+            e.value = TextEdit::new("");
+        }
+    }
+
     fn delete_bot(&mut self, slug: &str) {
         self.confirm = None;
         if let Err(e) = bots::delete(slug) {
@@ -784,6 +865,11 @@ fn toolbar_actions(s: &App, k: &Kit) -> El {
                     .build(k),
             )
             .child(
+                small("Environment…", ButtonVariant::Ghost)
+                    .on_press(|s: &mut App| s.env_edit = Some(EnvEdit::open(s.selected.clone())))
+                    .build(k),
+            )
+            .child(
                 small("Open folder", ButtonVariant::Ghost)
                     .on_press(|s: &mut App| s.open_folder())
                     .build(k),
@@ -895,6 +981,25 @@ fn sidebar(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
             )
             .child(model),
     );
+    footer = footer
+        .child(
+            SidebarRow::new("Instructions for all bots")
+                .height(32.0)
+                .on_select(|s: &mut App, _| {
+                    let mut t = TextEdit::new(store::instructions());
+                    t.focused = true;
+                    s.instructions = Some(t);
+                })
+                .build(k)
+                .key("instructions"),
+        )
+        .child(
+            SidebarRow::new("Environment variables")
+                .height(32.0)
+                .on_select(|s: &mut App, _| s.env_edit = Some(EnvEdit::open(None)))
+                .build(k)
+                .key("environment"),
+        );
     sb = sb.footer(footer);
     sb.build(k)
 }
@@ -1342,10 +1447,119 @@ fn permission(k: &Kit, p: &opencode::Permission) -> El {
         .key(format!("perm/{}", p.id))
 }
 
+fn env_dialog(s: &App, e: &EnvEdit, k: &Kit, layer: &mut Vec<El>) {
+    let mine = e
+        .bot
+        .as_ref()
+        .map_or(&e.env.global, |b| e.env.bots.get(b).unwrap_or(&EMPTY_VARS));
+    let mut rows = col().w_full().gap(4.0);
+    for name in mine.keys() {
+        let n = name.clone();
+        rows = rows.child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .items_center()
+                .child(
+                    text(name.clone())
+                        .font(k.ty.mono)
+                        .color(k.c.text_base)
+                        .grow(1.0),
+                )
+                .child(text("set").font(k.ty.small).color(k.c.text_faint))
+                .child(
+                    small("Remove", ButtonVariant::GhostFaint)
+                        .on_press(move |s: &mut App| s.remove_env(&n))
+                        .build(k),
+                )
+                .key(format!("env/{name}")),
+        );
+    }
+    if e.bot.is_some() {
+        for name in e.env.global.keys().filter(|n| !mine.contains_key(*n)) {
+            rows = rows.child(
+                row()
+                    .w_full()
+                    .gap(8.0)
+                    .child(
+                        text(name.clone())
+                            .font(k.ty.mono)
+                            .color(k.c.text_faint)
+                            .grow(1.0),
+                    )
+                    .child(text("global").font(k.ty.small).color(k.c.text_faint))
+                    .key(format!("env/global/{name}")),
+            );
+        }
+    }
+    if mine.is_empty() && (e.bot.is_none() || e.env.global.is_empty()) {
+        rows = rows.child(
+            text("No variables yet.")
+                .font(k.ty.small)
+                .color(k.c.text_faint),
+        );
+    }
+    let name = TextInput::new(&e.name)
+        .placeholder("GOTIFY_TOKEN")
+        .width(Some(200.0))
+        .on_edit(|s: &mut App| &mut s.env_edit.as_mut().expect("dialog open").name)
+        .on_submit(|s: &mut App, _| s.add_env())
+        .build(k);
+    let value = TextInput::new(&e.value)
+        .placeholder("Value")
+        .secure()
+        .width(None)
+        .on_edit(|s: &mut App| &mut s.env_edit.as_mut().expect("dialog open").value)
+        .on_submit(|s: &mut App, _| s.add_env())
+        .build(k);
+    let add = small("Add", ButtonVariant::Outline)
+        .on_press(|s: &mut App| s.add_env())
+        .build(k);
+    let done = Button::new("Done")
+        .variant(ButtonVariant::Contrast)
+        .on_press(close_dialogs)
+        .build(k);
+    let (title, desc) = match &e.bot {
+        None => (
+            "Environment variables".to_string(),
+            "Every bot's shell commands, scripts and subagents get these. Bots see only the names; values are hidden from them, even in command output. A bot's own variable of the same name wins.",
+        ),
+        Some(b) => (
+            format!(
+                "{} environment",
+                s.bots.get(b).map_or(b.as_str(), |x| x.name.as_str())
+            ),
+            "This bot's shell commands, scripts and subagents get these as well as the global ones. Bots see only the names; values are hidden from them, even in command output.",
+        ),
+    };
+    modal(
+        "environment",
+        &title,
+        Some(desc),
+        vec![
+            rows,
+            row()
+                .w_full()
+                .gap(8.0)
+                .items_center()
+                .child(name)
+                .child(value.grow(1.0))
+                .child(add),
+        ],
+        vec![done],
+        k,
+        layer,
+    );
+}
+
+static EMPTY_VARS: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+
 fn close_dialogs(s: &mut App) {
     s.confirm = None;
     s.new_bot = None;
     s.schedule_edit = None;
+    s.instructions = None;
+    s.env_edit = None;
 }
 
 fn modal(
@@ -1394,6 +1608,32 @@ fn label(k: &Kit, t: &str) -> El {
 }
 
 fn dialogs(s: &App, k: &Kit, layer: &mut Vec<El>) {
+    if let Some(t) = &s.instructions {
+        let area = TextArea::new(t)
+            .placeholder("e.g. I have Gotify at https://gotify.example.com: to notify me, POST to /message with the token in $GOTIFY_TOKEN.")
+            .auto_grow(10, 24)
+            .width(None)
+            .on_edit(|s: &mut App| s.instructions.as_mut().expect("dialog open"))
+            .build(k);
+        let save = Button::new("Save")
+            .variant(ButtonVariant::Contrast)
+            .on_press(|s: &mut App| s.save_instructions())
+            .build(k);
+        modal(
+            "instructions",
+            "Instructions for all bots",
+            Some(
+                "Part of every bot's system prompt, and its subagents'. Takes effect from each bot's next run.",
+            ),
+            vec![area],
+            vec![cancel(k), save],
+            k,
+            layer,
+        );
+    }
+    if let Some(e) = &s.env_edit {
+        env_dialog(s, e, k, layer);
+    }
     if let Some((name, purpose)) = &s.new_bot {
         let name = TextInput::new(name)
             .placeholder("Inbox triager")
@@ -1644,6 +1884,26 @@ fn main() {
                 s.new_bot = Some(new_bot_edits());
             }),
             ("empty", |_: &mut App| {}),
+            ("environment", |s: &mut App| {
+                demo(s);
+                let mut e = EnvEdit::open(Some("inbox-triager".into()));
+                e.env = env::Env::default();
+                e.env.global.insert("GOTIFY_TOKEN".into(), "x".into());
+                e.env.global.insert("GOTIFY_URL".into(), "x".into());
+                e.env
+                    .scope(Some("inbox-triager"))
+                    .insert("GMAIL_LABEL".into(), "x".into());
+                e.env
+                    .scope(Some("inbox-triager"))
+                    .insert("GOTIFY_URL".into(), "y".into());
+                s.env_edit = Some(e);
+            }),
+            ("instructions", |s: &mut App| {
+                demo(s);
+                s.instructions = Some(TextEdit::new(
+                    "I have Gotify at https://gotify.example.com. To notify me, POST to /message with the token in $GOTIFY_TOKEN.\n\nI'm in US Eastern time.",
+                ));
+            }),
             ("weekly", |s: &mut App| {
                 demo(s);
                 s.selected = Some("fantasy-football".into());

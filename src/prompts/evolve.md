@@ -18,13 +18,22 @@ Keep these sections, in this order. Rewrite them in place; never let them grow s
   `3. In parallel (dumbot-worker, one per player): check injury news → memory/work/injuries-<player>.md`.
 - `## Knowledge`: facts every run needs: URLs, accounts, page layouts and selectors,
   commands, rules of the domain, the user's preferences. Short bullets.
-- `## Toolkit`: each skill and subagent you've written, one line each: id, what it does,
-  when to use it.
+- `## Toolkit`: each script, skill and subagent you've written, one line each: what it does,
+  how to call it, when to use it.
 - `## Memory`: what each file in memory/ holds and when to read it.
 - `## Changelog`: one line per run, newest last, at most 20.
 
 Aim for under about 250 lines. Move detail that only some runs need into a skill or a
 memory file and point to it.
+
+## A script
+
+Commands you'd otherwise retype every run: fetching and parsing a page, calling an API,
+sending a notification. Write `scripts/<name>` (shell, Python, …) with a shebang line and a
+comment saying what it does and how to call it, `chmod +x` it, and run it by path. Scripts
+get your environment variables; use them by name (`$GOTIFY_TOKEN`), never write their values
+into a script. Make scripts print plain, short results you can act on, and exit non-zero on
+failure.
 
 ## A skill
 

@@ -58,6 +58,24 @@ A bot whose last run is still working (or waiting on its subagents) waits for it
 Bots only wake while the app is running; times missed while it was closed run once when it
 next starts.
 
+## Instructions, environment variables and scripts
+
+- **Instructions for all bots** (sidebar) is markdown added to every bot's system prompt, and
+  its subagents'. Use it for what every bot should know: "I have Gotify at …; the token is in
+  `$GOTIFY_TOKEN`", your time zone, house rules. It's kept in
+  `~/.local/share/dumbot/instructions.md`.
+- **Environment variables**, global (sidebar) or per bot (**Environment…**), are for secrets
+  and settings. They live in `~/.local/share/dumbot/env.json` (owner-only), outside every
+  bot's folder. Each bot folder's opencode config sets its `shell` to a dumBot wrapper
+  (`~/.local/share/dumbot/shell/<slug>`, running `dumbot shell <slug>`), so every shell
+  command the bot or its subagents run gets them. Bots are told only the names. The wrapper
+  replaces any value in command output with `[$NAME]`, and permission rules block reading
+  `env.json` and dumping the environment. A bot could still put a value somewhere outside
+  command output (say, write it into a file and open that with the read tool); its
+  instructions forbid that, but it isn't enforced.
+- **Scripts**: bots keep reusable scripts in `scripts/`, which they can run without asking.
+  Scripts get the environment variables and show up in the app.
+
 ## Features
 
 - A list of bots with their next wake-up or running status. **New bot** (⌘N) creates one and

@@ -50,6 +50,21 @@ pub fn data_dir() -> PathBuf {
         .join("dumbot")
 }
 
+fn instructions_path() -> PathBuf {
+    data_dir().join("instructions.md")
+}
+
+/// The user's instructions for every bot, added to every run's system prompt.
+pub fn instructions() -> String {
+    std::fs::read_to_string(instructions_path()).unwrap_or_default()
+}
+
+pub fn save_instructions(text: &str) -> Result<()> {
+    std::fs::create_dir_all(data_dir()).context("create data dir")?;
+    std::fs::write(instructions_path(), text)?;
+    Ok(())
+}
+
 impl Store {
     fn path() -> PathBuf {
         data_dir().join("state.json")

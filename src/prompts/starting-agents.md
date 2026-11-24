@@ -16,8 +16,9 @@ Facts every run needs: URLs, accounts, page layouts, commands, the user's prefer
 
 ## Toolkit
 
-Skills and subagents I've written for myself, and when to use them. I always have
-dumbot-worker (a general subagent for parallel tasks) and the dumbot-evolve skill.
+Scripts (scripts/), skills and subagents I've written for myself, and when to use them. I
+always have dumbot-worker (a general subagent for parallel tasks) and the dumbot-evolve
+skill.
 
 ## Memory
 

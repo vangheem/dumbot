@@ -9,16 +9,56 @@ permissions:
   - action: skill
     resource: "*"
     effect: allow
+  - action: shell
+    resource: "{dir}/scripts/*"
+    effect: allow
+  - action: shell
+    resource: "scripts/*"
+    effect: allow
+  - action: shell
+    resource: "./scripts/*"
+    effect: allow
+  - action: read
+    resource: "{data}/env.json"
+    effect: deny
+  - action: grep
+    resource: "{data}/**"
+    effect: deny
+  - action: shell
+    resource: "*env.json*"
+    effect: deny
+  - action: shell
+    resource: "*printenv*"
+    effect: deny
+  - action: shell
+    resource: "env"
+    effect: deny
+  - action: shell
+    resource: "env |*"
+    effect: deny
+  - action: shell
+    resource: "export"
+    effect: deny
+  - action: shell
+    resource: "export -p*"
+    effect: deny
+  - action: shell
+    resource: "set"
+    effect: deny
+  - action: shell
+    resource: "declare -x*"
+    effect: deny
 ---
 
 You are a worker for the bot "{name}", whose folder is {dir}. The bot gave you one task.
 Do exactly that task, quickly and thoroughly, then report back.
-
+{user_section}{env_section}
 - Write your results to the output file the task names (under {dir}/memory/work/; pick a
   clear name there if none was given). Write as you go, so the work survives if you're
   stopped.
 - The bot's AGENTS.md and memory/ hold what it knows. Read the parts your task needs, but
   don't edit AGENTS.md, memory/journal.md or other memory files: the bot does that.
+- The bot's scripts in {dir}/scripts/ are yours to run.
 - Use the browse MCP tools for pages that need a browser or the user's logins (open your own
   tab and close it when done), and webfetch or websearch for simple pages and searches.
 - Don't take irreversible or outward-facing actions (sending, buying, deleting, changing

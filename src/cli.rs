@@ -11,6 +11,11 @@ pub fn run(args: &[String]) -> bool {
         Some("wake") => wake(&args[2..]),
         Some("list") => list(),
         Some("run") => run_bot(&args[2..]),
+        // The shell wrapper bots' commands run through (see `env`).
+        Some("shell") => match crate::env::run_shell(&args[2..]) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => Err(e),
+        },
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             Ok(())

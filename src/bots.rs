@@ -185,12 +185,18 @@ fn starting_agents_md(name: &str, purpose: &str) -> String {
 }
 
 pub fn delete(slug: &str) -> Result<()> {
+    let mut env = crate::env::load();
+    if env.bots.remove(slug).is_some() {
+        env.save()?;
+    }
+    let _ = std::fs::remove_file(crate::env::wrapper_path(slug));
     let d = dir(slug);
     std::fs::remove_dir_all(&d).with_context(|| format!("remove {}", d.display()))
 }
 
 /// The bot's markdown files as `(relative path, contents)`: AGENTS.md first, then the rest
-/// by path, including the skills and subagents it wrote under `.opencode/` (but not dumBot's).
+/// by path, including the skills and subagents it wrote under `.opencode/` (but not dumBot's)
+/// and its scripts.
 pub fn files(slug: &str) -> Vec<(String, String)> {
     let root = dir(slug);
     let mut out = Vec::new();
@@ -218,6 +224,13 @@ fn collect(root: &Path, at: &Path, out: &mut Vec<(String, String)>) {
                 let body = std::fs::read_to_string(&path).unwrap_or_default();
                 out.push((rel, body));
             }
+        } else if let Ok(rel) = path.strip_prefix(root)
+            && rel.starts_with("scripts")
+            && let Ok(body) = std::fs::read_to_string(&path)
+        {
+            // Scripts show as code.
+            let rel = rel.to_string_lossy().into_owned();
+            out.push((rel, format!("```\n{}\n```", body.trim_end())));
         }
     }
 }
@@ -266,18 +279,64 @@ pub fn prepare(slug: &str, bot: &Bot) -> Result<()> {
         }
     }
     std::fs::create_dir_all(d.join("memory/work"))?;
+    std::fs::create_dir_all(d.join("scripts"))?;
     let (dir, exe) = (d.display().to_string(), exe());
+    let (user, env) = (user_section(), env_section(slug));
     for (rel, template) in MANAGED {
         let path = d.join(rel);
         std::fs::create_dir_all(path.parent().unwrap())?;
+        // Sections first: the user's text is theirs, and isn't scanned for placeholders.
         let body = template
             .replace("{name}", &bot.name)
             .replace("{dir}", &dir)
+            .replace("{data}", &store::data_dir().display().to_string())
             .replace("{exe}", &exe)
-            .replace("{slug}", slug);
+            .replace("{slug}", slug)
+            .replace("{env_section}", &env)
+            .replace("{user_section}", &user);
         std::fs::write(path, body)?;
     }
+    // Every shell command in the folder (the run's and its subagents') goes through the
+    // wrapper, which adds the bot's environment variables.
+    let shell = crate::env::write_wrapper(slug, &exe)?;
+    std::fs::write(
+        d.join(".opencode/opencode.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "$schema": "https://opencode.ai/config.json",
+            "shell": shell,
+        }))?,
+    )?;
     Ok(())
+}
+
+fn user_section() -> String {
+    let text = store::instructions();
+    if text.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n# From the user\n\nThe user's instructions for all their bots:\n\n{}\n",
+        text.trim()
+    )
+}
+
+fn env_section(slug: &str) -> String {
+    let names: Vec<String> = crate::env::load()
+        .for_bot(slug)
+        .into_keys()
+        .map(|n| format!("`{n}`"))
+        .collect();
+    if names.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n# Environment variables\n\nYour shell commands and scripts, and your subagents', \
+         have these environment variables: {}. Use them by name (`$NAME`) in commands and \
+         scripts. Their values are secret: never print, echo, log or write them anywhere (files, \
+         memory, messages), and never copy them into scripts. dumBot hides them in command \
+         output as `[$NAME]`.\n",
+        names.join(", ")
+    )
 }
 
 fn exe() -> String {
