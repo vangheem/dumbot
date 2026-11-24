@@ -75,7 +75,6 @@ struct App {
     confirm: Option<Confirm>,
     new_bot: Option<(TextEdit, TextEdit)>,
     schedule_edit: Option<(TextEdit, TextEdit)>,
-    settings: bool,
     toast: Option<(String, bool)>,
     toast_until: Option<f64>,
     update: Option<String>,
@@ -116,7 +115,6 @@ fn init() -> App {
         confirm: None,
         new_bot: None,
         schedule_edit: None,
-        settings: false,
         toast: None,
         toast_until: None,
         update: None,
@@ -269,14 +267,9 @@ impl App {
         let Some(bot) = self.bots.get(&slug).cloned() else {
             return;
         };
-        let model = bot.model.clone().or_else(|| self.store.model.clone());
+        let default = self.store.model.clone();
         let oc = self.client();
         self.starting.insert(slug.clone());
-        let mut text = bots::preamble(&slug, &bot, &reason);
-        if let Some(m) = message {
-            text = format!("{text}\n\n{MESSAGE_MARK}{m}");
-        }
-        let title = format!("{}: {reason}", bot.name);
         let s2 = slug.clone();
         self.bg(
             move || -> anyhow::Result<String> {
@@ -284,19 +277,7 @@ impl App {
                     Some(c) => c,
                     None => Client::connect()?,
                 };
-                let id = oc.create_session(&title, &bots::dir(&s2), model.as_ref())?;
-                // The note was for this run; it's read now.
-                bots::add_run(
-                    &s2,
-                    Run {
-                        session: id.clone(),
-                        started: bots::now(),
-                        reason,
-                    },
-                )?;
-                bots::update(&s2, |b| b.note = None)?;
-                oc.prompt(&id, &text)?;
-                Ok(id)
+                bots::start_run(&oc, &s2, &bot, &reason, message.as_deref(), default)
             },
             move |s, res, tx| {
                 s.starting.remove(&slug);
@@ -398,6 +379,35 @@ impl App {
     fn choose_default_model(&mut self, key: &str) {
         self.store.model = ModelRef::parse(key);
         self.save();
+        // Bots on the default model switch their latest run too.
+        let Some(m) = self.store.model.clone() else {
+            return;
+        };
+        let sessions: Vec<String> = self
+            .bots
+            .values()
+            .filter(|b| b.model.is_none())
+            .filter_map(|b| b.last_session().map(str::to_string))
+            .collect();
+        self.switch_model(sessions, m);
+    }
+
+    /// Switches sessions to `m`, so their next turn (a message, or the rest of a working
+    /// run) already uses it.
+    fn switch_model(&mut self, sessions: Vec<String>, m: ModelRef) {
+        let Some(oc) = self.client() else { return };
+        if sessions.is_empty() {
+            return;
+        }
+        self.bg(
+            move || sessions.iter().try_for_each(|id| oc.set_model(id, &m)),
+            |s, res, _| {
+                s.next_chat_poll = 0.0;
+                if let Err(e) = res {
+                    s.notify(format!("Couldn't switch the run's model: {e}"), true);
+                }
+            },
+        );
     }
 
     /// `""` goes back to the default model.
@@ -408,6 +418,10 @@ impl App {
         let model = ModelRef::parse(key);
         match bots::update(&slug, |b| b.model = model) {
             Ok(b) => {
+                let effective = b.model.clone().or_else(|| self.store.model.clone());
+                if let (Some(id), Some(m)) = (b.last_session(), effective) {
+                    self.switch_model(vec![id.to_string()], m);
+                }
                 self.bots.insert(slug, b);
             }
             Err(e) => self.notify(e.to_string(), true),
@@ -535,9 +549,6 @@ impl App {
         });
     }
 }
-
-/// Separates a user's message from the run preamble in a run's first prompt.
-const MESSAGE_MARK: &str = "Message from the user:\n";
 
 fn setup(s: &mut App, waker: Waker) {
     s.waker = Some(waker);
@@ -687,7 +698,11 @@ fn view(s: &App, cx: &mut Cx<App>) -> El {
         )
         .trailing(toolbar_actions(s, &k));
     let split = SplitView::new(main_pane(s, &k))
-        .sidebar(&s.sidebar, |s: &mut App| &mut s.sidebar, sidebar(s, &k))
+        .sidebar(
+            &s.sidebar,
+            |s: &mut App| &mut s.sidebar,
+            sidebar(s, &k, &mut layer),
+        )
         .inspector(
             &s.inspector,
             |s: &mut App| &mut s.inspector,
@@ -784,7 +799,15 @@ fn toolbar_actions(s: &App, k: &Kit) -> El {
     )
 }
 
-fn sidebar(s: &App, k: &Kit) -> El {
+/// The combobox's current id: the model's key, or "" (the default option) for none. A model
+/// that isn't an option (models still loading, or since disabled) gives none, so the
+/// placeholder shows instead of a blank field.
+fn known(options: &[ComboboxOption], m: Option<&ModelRef>) -> Option<String> {
+    let key = m.map_or(String::new(), ModelRef::key);
+    options.iter().any(|o| o.id == key).then_some(key)
+}
+
+fn sidebar(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     let now = bots::now();
     let mut rows = Vec::new();
     for (slug, bot) in &s.bots {
@@ -833,18 +856,41 @@ fn sidebar(s: &App, k: &Kit) -> El {
                 .key("update-available"),
         );
     }
-    let default = s
-        .store
-        .model
-        .as_ref()
-        .map_or("opencode default".into(), |m| s.model_name(m));
+    let mut options = vec![ComboboxOption::new("", "opencode default")];
+    options.extend(s.models.iter().cloned());
+    let current = known(&options, s.store.model.as_ref());
+    let model = Combobox::new(
+        "default-model",
+        &s.default_combo,
+        &options,
+        |s: &mut App| &mut s.default_combo,
+    )
+    .label("Default model")
+    .current(current.as_deref())
+    .placeholder(if s.models.is_empty() {
+        "Loading models…"
+    } else {
+        "opencode default"
+    })
+    .search_placeholder("Search models")
+    .width(240.0)
+    .max_height(360.0)
+    .placement(rune_kit::Placement::TopStart)
+    .disabled(s.models.is_empty())
+    .on_choose(|s: &mut App, id: &str, _: &mut Tx| s.choose_default_model(id))
+    .build(k, layer);
     footer = footer.child(
-        SidebarRow::new("Settings")
-            .subtitle(format!("Default model: {default}"))
-            .height(44.0)
-            .on_select(|s: &mut App, _| s.settings = true)
-            .build(k)
-            .key("settings"),
+        col()
+            .w_full()
+            .px(12.0)
+            .py(8.0)
+            .gap(6.0)
+            .child(
+                text("Default model")
+                    .font(k.ty.small_medium)
+                    .color(k.c.text_muted),
+            )
+            .child(model),
     );
     sb = sb.footer(footer);
     sb.build(k)
@@ -1028,6 +1074,15 @@ fn agent_panel(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
         .child(picker);
 
     let mut transcript = col().w_full().gap(10.0).padding(12.0);
+    if let Some(u) = snap.map(|c| &c.usage) {
+        transcript = transcript.child(
+            text(usage_line(s, u))
+                .font(k.ty.small)
+                .color(k.c.text_faint)
+                .wrap()
+                .key("usage"),
+        );
+    }
     if let Some(e) = &s.oc_error {
         transcript = transcript.child(
             text(format!("opencode unavailable: {e}"))
@@ -1058,7 +1113,7 @@ fn agent_panel(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
                                 .wrap()
                                 .key(format!("r{i}")),
                         );
-                        match t.split_once(MESSAGE_MARK) {
+                        match t.split_once(bots::MESSAGE_MARK) {
                             Some((_, m)) => Entry::User(m.to_string()),
                             None => continue,
                         }
@@ -1084,12 +1139,12 @@ fn agent_panel(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
 
     let mut options = vec![ComboboxOption::new("", "Default model")];
     options.extend(s.models.iter().cloned());
-    let current = bot.model.as_ref().map_or(String::new(), ModelRef::key);
+    let current = known(&options, bot.model.as_ref());
     let model = Combobox::new("bot-model", &s.model_combo, &options, |s: &mut App| {
         &mut s.model_combo
     })
     .label("Model")
-    .current(Some(current.as_str()))
+    .current(current.as_deref())
     .search_placeholder("Search models")
     .width(240.0)
     .max_height(320.0)
@@ -1165,6 +1220,30 @@ fn agent_panel(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
                 .child(transcript),
         )
         .child(composer)
+}
+
+/// `Claude Haiku · 15.7k in (15.7k cached) · 33 out · $0.002`.
+fn usage_line(s: &App, u: &opencode::Usage) -> String {
+    let n = |v: u64| match v {
+        0..1_000 => v.to_string(),
+        1_000..1_000_000 => format!("{:.1}k", v as f64 / 1e3),
+        _ => format!("{:.2}M", v as f64 / 1e6),
+    };
+    let model = u
+        .model
+        .as_ref()
+        .map_or("model not chosen yet".into(), |m| s.model_name(m));
+    let input = u.input + u.cache_read + u.cache_write;
+    let cached = u.cache_read + u.cache_write;
+    let mut line = format!("{model} · {} in", n(input));
+    if cached > 0 {
+        line.push_str(&format!(" ({} cached)", n(cached)));
+    }
+    line.push_str(&format!(" · {} out", n(u.output + u.reasoning)));
+    if u.cost > 0.0 {
+        line.push_str(&format!(" · ${:.3}", u.cost));
+    }
+    line
 }
 
 fn entry(k: &Kit, e: &Entry) -> El {
@@ -1263,7 +1342,6 @@ fn close_dialogs(s: &mut App) {
     s.confirm = None;
     s.new_bot = None;
     s.schedule_edit = None;
-    s.settings = false;
 }
 
 fn modal(
@@ -1369,38 +1447,6 @@ fn dialogs(s: &App, k: &Kit, layer: &mut Vec<El>) {
             )),
             vec![label(k, "When"), when, label(k, "Note"), note],
             vec![cancel(k), save],
-            k,
-            layer,
-        );
-    }
-    if s.settings {
-        let mut options = vec![ComboboxOption::new("", "opencode default")];
-        options.extend(s.models.iter().cloned());
-        let current = s.store.model.as_ref().map_or(String::new(), ModelRef::key);
-        let model = Combobox::new(
-            "default-model",
-            &s.default_combo,
-            &options,
-            |s: &mut App| &mut s.default_combo,
-        )
-        .label("Default model")
-        .current(Some(current.as_str()))
-        .search_placeholder("Search models")
-        .width(300.0)
-        .max_height(320.0)
-        .disabled(s.models.is_empty())
-        .on_choose(|s: &mut App, id: &str, _: &mut Tx| s.choose_default_model(id))
-        .build(k, layer);
-        let done = Button::new("Done")
-            .variant(ButtonVariant::Contrast)
-            .on_press(close_dialogs)
-            .build(k);
-        modal(
-            "settings",
-            "Settings",
-            Some("Bots without their own model use this one."),
-            vec![label(k, "Default model"), model],
-            vec![done],
             k,
             layer,
         );
@@ -1548,6 +1594,14 @@ fn demo(s: &mut App) {
         ("memory/today.md".into(), "# Needs a reply\n\n1. Dana: lease renewal".into()),
     ];
     s.file = Some("AGENTS.md".into());
+    s.models = ["Claude Opus", "Claude Haiku", "GPT-6", "Gemini 4"]
+        .iter()
+        .map(|n| {
+            let mut o = ComboboxOption::new(format!("demo/{n}"), *n);
+            o.detail = "demo".into();
+            o
+        })
+        .collect();
     s.chats.insert(
         "ses_demo".into(),
         Snapshot {
@@ -1559,6 +1613,14 @@ fn demo(s: &mut App) {
             ],
             running: false,
             permissions: Vec::new(),
+            usage: opencode::Usage {
+                model: Some(ModelRef::parse("demo/Claude Haiku").unwrap()),
+                input: 1_204,
+                output: 2_310,
+                cache_read: 48_200,
+                cost: 0.041,
+                ..Default::default()
+            },
         },
     );
 }
@@ -1577,6 +1639,11 @@ fn main() {
                 s.new_bot = Some(new_bot_edits());
             }),
             ("empty", |_: &mut App| {}),
+            ("default-model", |s: &mut App| {
+                demo(s);
+                s.default_combo
+                    .step(rune_kit::ComboboxEvent::Toggle { current: None });
+            }),
         ],
         setup: Some(setup),
         poll: Some(poll),
@@ -1608,13 +1675,13 @@ mod live_tests {
         unsafe { std::env::set_var("XDG_DATA_HOME", &tmp) };
         let slug = bots::create("Live test", "Do nothing.").unwrap();
         assert!(bots::list().contains_key(&slug));
-        assert!(
-            bots::preamble(&slug, &bots::load(&slug).unwrap(), "test")
-                .starts_with(bots::RUN_PREFIX)
-        );
+        assert!(bots::preamble(&bots::load(&slug).unwrap(), "test").starts_with(bots::RUN_PREFIX));
+        bots::prepare(&slug, &bots::load(&slug).unwrap()).unwrap();
+        assert!(bots::dir(&slug).join(".git").exists());
+        assert_eq!(bots::files(&slug)[0].0, "AGENTS.md");
         let oc = Client::connect().unwrap();
         let id = oc
-            .create_session("dumbot live test", &bots::dir(&slug), None)
+            .create_session("dumbot live test", &bots::dir(&slug), bots::AGENT, None)
             .unwrap();
         bots::add_run(
             &slug,

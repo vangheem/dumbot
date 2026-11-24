@@ -49,6 +49,42 @@ pub struct Snapshot {
     pub entries: Vec<Entry>,
     pub running: bool,
     pub permissions: Vec<Permission>,
+    pub usage: Usage,
+}
+
+/// A session's model and what it has used so far.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Usage {
+    pub model: Option<ModelRef>,
+    pub input: u64,
+    pub output: u64,
+    pub reasoning: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub cost: f64,
+}
+
+fn usage(info: &Value) -> Usage {
+    let t = &info["tokens"];
+    let n = |v: &Value| v.as_u64().unwrap_or(0);
+    Usage {
+        model: match (
+            info["model"]["providerID"].as_str(),
+            info["model"]["id"].as_str(),
+        ) {
+            (Some(provider), Some(id)) => Some(ModelRef {
+                provider: provider.into(),
+                id: id.into(),
+            }),
+            _ => None,
+        },
+        input: n(&t["input"]),
+        output: n(&t["output"]),
+        reasoning: n(&t["reasoning"]),
+        cache_read: n(&t["cache"]["read"]),
+        cache_write: n(&t["cache"]["write"]),
+        cost: info["cost"].as_f64().unwrap_or(0.0),
+    }
 }
 
 fn service_file() -> PathBuf {
@@ -128,9 +164,10 @@ impl Client {
         &self,
         title: &str,
         dir: &Path,
+        agent: &str,
         model: Option<&ModelRef>,
     ) -> Result<String> {
-        let mut body = json!({ "title": title, "location": { "directory": dir } });
+        let mut body = json!({ "title": title, "agent": agent, "location": { "directory": dir } });
         if let Some(m) = model {
             body["model"] = json!({ "id": m.id, "providerID": m.provider });
         }
@@ -139,6 +176,14 @@ impl Client {
             .as_str()
             .map(str::to_string)
             .ok_or_else(|| anyhow!("session create returned no id"))
+    }
+
+    pub fn set_model(&self, id: &str, m: &ModelRef) -> Result<()> {
+        self.post(
+            &format!("/api/session/{id}/model"),
+            json!({ "model": { "id": m.id, "providerID": m.provider } }),
+        )?;
+        Ok(())
     }
 
     /// Enabled models as `(provider/id, name, provider)`, sorted by provider then name.
@@ -198,6 +243,7 @@ impl Client {
     pub fn snapshot(&self, id: &str) -> Result<Snapshot> {
         let messages = self.get(&format!("/api/session/{id}/message?order=desc&limit=200"))?;
         let active = self.get("/api/session/active")?;
+        let info = self.get(&format!("/api/session/{id}"))?;
         let permissions = self
             .get(&format!("/api/session/{id}/permission"))
             .unwrap_or(Value::Null);
@@ -207,6 +253,7 @@ impl Client {
                 .map(|m| m.iter().rev().flat_map(entries).collect())
                 .unwrap_or_default(),
             running: active["data"].get(id).is_some(),
+            usage: usage(&info["data"]),
             permissions: permissions["data"]
                 .as_array()
                 .map(|p| {

@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
+use crate::opencode::Client;
 use crate::store::{self, ModelRef};
 
 /// How many past runs a bot remembers.
@@ -155,8 +156,8 @@ pub fn create(name: &str, purpose: &str) -> Result<String> {
 
 fn starting_agents_md(name: &str, purpose: &str) -> String {
     format!(
-        "# {name}\n\n## Purpose\n\n{purpose}\n\n## How I work\n\nNot worked out yet. Rewrite \
-         this section as I learn how to do the job well.\n"
+        "# {name}\n\n## Purpose\n\n{purpose}\n\n## How I work\n\nTODO: write the steps I \
+         follow, once I've done the job for the first time.\n\n## Changelog\n"
     )
 }
 
@@ -181,8 +182,11 @@ fn collect(root: &Path, at: &Path, out: &mut Vec<(String, String)>) {
     };
     for e in entries.flatten() {
         let path = e.path();
+        let hidden = e.file_name().to_string_lossy().starts_with('.');
         if path.is_dir() {
-            collect(root, &path, out);
+            if !hidden {
+                collect(root, &path, out);
+            }
         } else if path.extension().is_some_and(|x| x == "md")
             && let Ok(rel) = path.strip_prefix(root)
         {
@@ -192,46 +196,160 @@ fn collect(root: &Path, at: &Path, out: &mut Vec<(String, String)>) {
     }
 }
 
-/// The first prompt of every run: who the bot is, where its state lives, and how it
-/// schedules its next run. Its first line is shown in place of the whole thing.
-pub fn preamble(slug: &str, bot: &Bot, reason: &str) -> String {
-    let exe = crate::appbundle::target_binary()
+/// The opencode agent every run uses, written into each bot's folder.
+pub const AGENT: &str = "dumbot";
+
+/// Readies a bot's folder for a run. opencode only loads a folder's AGENTS.md and
+/// `.opencode/agents/` when the folder is a project (a git repository), so it gets one; and the
+/// `dumbot` agent is (re)written, so it always matches this version of dumBot.
+pub fn prepare(slug: &str, bot: &Bot) -> Result<()> {
+    let d = dir(slug);
+    if !d.join(".git").exists() {
+        let out = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&d)
+            .output()
+            .context("run git init in the bot's folder")?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "git init failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+    }
+    let agents = d.join(".opencode/agents");
+    std::fs::create_dir_all(&agents)?;
+    std::fs::write(agents.join(format!("{AGENT}.md")), agent_md(slug, bot))?;
+    Ok(())
+}
+
+fn exe() -> String {
+    crate::appbundle::target_binary()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "dumbot".into());
-    let dir = dir(slug);
-    let now = chrono::Local::now().format("%A %Y-%m-%d %H:%M %Z");
+        .unwrap_or_else(|_| "dumbot".into())
+}
+
+/// The agent's frontmatter (permissions: its own folder and `dumbot wake` need no approval)
+/// and system prompt: how a bot works, run after run.
+fn agent_md(slug: &str, bot: &Bot) -> String {
+    let dir = dir(slug).display().to_string();
+    let exe = exe();
+    format!(
+        r###"---
+description: A dumBot bot. Written by dumBot before every run; edits are overwritten.
+mode: primary
+color: "#ffcc66"
+permissions:
+  - action: edit
+    resource: "{dir}/**"
+    effect: allow
+  - action: shell
+    resource: "{exe} wake *"
+    effect: allow
+  - action: shell
+    resource: "dumbot wake *"
+    effect: allow
+---
+
+You are "{name}", a bot that dumBot runs on the user's computer through opencode. You live in
+the folder {dir}. You run in short, separate sessions: nothing carries over between runs except
+the files in your folder, so they are your memory and your self.
+
+# Your files
+
+- AGENTS.md is who you are: your purpose and your operating manual. It is already loaded in
+  your instructions; you don't need to read it. You own it and you keep rewriting it.
+- memory/ holds everything else you keep: notes, logs, to-do lists, what you've already seen or
+  handled. Create, reorganize and prune markdown files there. Prefer a few well-named files.
+
+# How you run
+
+1. Read the memory/ files this run needs.
+2. Do the work your purpose calls for. Use the browse MCP tools for anything in a web browser
+   (reuse the user's logged-in browser; close tabs you open). Use the shell and other tools
+   for anything on the computer.
+3. Keep AGENTS.md current while you work, not only at the end. The moment you learn something
+   the next run should know, edit AGENTS.md: a better way to do a step, a dead end to avoid,
+   a URL, page layout or command that works, the user's preferences, a sharper understanding of
+   your purpose. Rewrite and reorganize rather than append; delete what's no longer true.
+4. Before you finish, review yourself. This step is required every run, never skipped:
+   - Compare AGENTS.md with what you actually did this run. "## How I work" must describe,
+     step by step, how you really do the job now, concretely enough that the next run can
+     follow it without rediscovering anything (exact paths, commands, URLs, what to check).
+     If it's missing, vague, a placeholder, or out of date, rewrite it now.
+   - Add one line to "## Changelog" at the bottom of AGENTS.md (create it if missing):
+     `- YYYY-MM-DD HH:MM: <what you changed in yourself and why>`, or
+     `- YYYY-MM-DD HH:MM: no change: <why the manual was already right>`. Keep the last 20.
+   - Update memory/ with what you did and what's pending.
+5. Schedule your next run. Always do this, as your last action:
+     {exe} wake {slug} in 30m
+   Other forms: in 2h, in 1d, at 09:00, at 2026-12-01 09:00, every 6h, off. Add
+   --note "what to do next time" to leave your next run a note. Pick the soonest time that's
+   actually useful; don't wake just to find nothing to do.
+6. End with a short summary for the user: what you did, how you changed, what you need from
+   them (if anything), and when you'll run next.
+
+# Rules
+
+- Serve the purpose the user wrote under "## Purpose". You may clarify and refine it as you
+  learn, but never drop or replace what the user asked for.
+- Stay inside your folder unless your purpose needs files elsewhere.
+- If you're blocked on the user (a login, 2FA, a decision), say so in your summary, write it
+  to memory/, and schedule your next run for when they've likely handled it.
+- Don't take irreversible or outward-facing actions (sending messages, buying, deleting
+  things that aren't yours) unless your purpose clearly calls for them.
+- Be concise in everything you write.
+"###,
+        name = bot.name,
+    )
+}
+
+/// The first prompt of a run: why it's running, the note its last run left, and the time.
+/// Its first line is shown in place of the whole thing.
+pub fn preamble(bot: &Bot, reason: &str) -> String {
     let note = bot
         .note
         .as_ref()
-        .map(|n| format!("\nYour last run left this note for you: {n}\n"))
+        .map(|n| format!("\nYour last run left you this note: {n}\n"))
         .unwrap_or_default();
-    format!(
-        "{RUN_PREFIX}{reason}
-
-You are \"{name}\", a bot that dumBot runs on the user's computer through opencode. Nothing \
-carries over between runs except the files in your folder, {dir}:
-
-- AGENTS.md: who you are, your purpose and how you work. It is loaded into every run. \
-Rewrite it whenever you learn something about doing your job better; keep it concise, current \
-and true. You may evolve, but keep serving the purpose the user gave you.
-- memory/: everything else you keep (notes, logs, to-do lists, things already seen or done). \
-Create, edit and prune markdown files there. Prefer a few well-organized files.
-
-Write down what your next run needs to know before you finish.
-
-Use the browse MCP tools for anything in a web browser.
-
-When you're done, decide when you should run next and schedule it:
-  {exe} wake {slug} in 30m
-Other forms: in 2h, in 1d, at 09:00, at 2026-12-01 09:00, every 6h, off. Add \
---note \"what to do next time\" to leave your next run a note. Without a schedule you won't \
-run again until the user starts you.
-{note}
-It is now {now}.",
-        name = bot.name,
-        dir = dir.display(),
-    )
+    let now = chrono::Local::now().format("%A %Y-%m-%d %H:%M %Z");
+    format!("{RUN_PREFIX}{reason}\n{note}\nIt is now {now}. Begin your run.")
 }
+
+/// Starts a run of a bot in a fresh session of the `dumbot` agent, with `message` from the
+/// user if any, and returns the session id. The bot's own model wins over `default`.
+pub fn start_run(
+    oc: &Client,
+    slug: &str,
+    bot: &Bot,
+    reason: &str,
+    message: Option<&str>,
+    default: Option<ModelRef>,
+) -> Result<String> {
+    prepare(slug, bot)?;
+    let model = bot.model.clone().or(default);
+    let title = format!("{}: {reason}", bot.name);
+    let id = oc.create_session(&title, &dir(slug), AGENT, model.as_ref())?;
+    add_run(
+        slug,
+        Run {
+            session: id.clone(),
+            started: now(),
+            reason: reason.into(),
+        },
+    )?;
+    // The note was for this run; it's read now.
+    update(slug, |b| b.note = None)?;
+    let mut text = preamble(bot, reason);
+    if let Some(m) = message {
+        text = format!("{text}\n\n{MESSAGE_MARK}{m}");
+    }
+    oc.prompt(&id, &text)?;
+    Ok(id)
+}
+
+/// Separates a user's message from the preamble in a run's first prompt.
+pub const MESSAGE_MARK: &str = "Message from the user:\n";
 
 pub const RUN_PREFIX: &str = "dumBot run: ";
 

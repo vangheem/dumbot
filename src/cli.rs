@@ -3,13 +3,14 @@
 
 use anyhow::{Result, anyhow};
 
-use crate::{bots, schedule};
+use crate::{bots, opencode, schedule, store};
 
 /// Returns false for anything that isn't one of these commands, so the app runs.
 pub fn run(args: &[String]) -> bool {
     let result = match args.get(1).map(String::as_str) {
         Some("wake") => wake(&args[2..]),
         Some("list") => list(),
+        Some("run") => run_bot(&args[2..]),
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             Ok(())
@@ -27,6 +28,7 @@ const USAGE: &str = "dumBot: bots that rewrite themselves, run through opencode.
 
   dumbot                         open the app
   dumbot list                    list bots and when they wake
+  dumbot run <bot> [message]     start a run now and print its session id
   dumbot wake <bot> <when> [--note TEXT]
         <when>: now | in 30m | in 1h30m | at 09:00 | at 2026-12-01 09:00 | every 6h | off
   dumbot install-app             add dumbot.app to ~/Applications (macOS)
@@ -56,6 +58,26 @@ fn wake(args: &[String]) -> Result<()> {
     let sched = schedule::parse(&when.join(" "), now)?;
     let b = bots::update(&slug, |b| schedule::apply(b, sched, note, now))?;
     println!("{}: {}", b.name, schedule::describe(&b, now));
+    Ok(())
+}
+
+fn run_bot(args: &[String]) -> Result<()> {
+    let bot = args
+        .first()
+        .ok_or_else(|| anyhow!("usage: dumbot run <bot> [message]"))?;
+    let slug = bots::slugify(bot);
+    let b = bots::load(&slug)?;
+    let message = (args.len() > 1).then(|| args[1..].join(" "));
+    let oc = opencode::Client::connect()?;
+    let id = bots::start_run(
+        &oc,
+        &slug,
+        &b,
+        "started from the command line",
+        message.as_deref(),
+        store::Store::load().model,
+    )?;
+    println!("{id}");
     Ok(())
 }
 

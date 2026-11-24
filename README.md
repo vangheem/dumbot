@@ -22,15 +22,24 @@ Each bot lives in `~/.local/share/dumbot/bots/<slug>/`:
   directory, so opencode loads it into every session. The bot rewrites it as it learns.
 - `memory/*.md`: everything else it keeps (notes, logs, to-dos, things already handled).
 - `bot.json`: dumBot's record of the bot's model, schedule and runs.
+- `.opencode/agents/dumbot.md`: the `dumbot` opencode agent every run uses, rewritten by
+  dumBot before each run. Its system prompt is the bot's operating loop: read memory, do the
+  work, keep `AGENTS.md` current as it learns, review itself and add a changelog line, then
+  schedule the next run. Its permissions let the bot edit its own folder and run
+  `dumbot wake` without asking.
 
-Every run is a new opencode session. Its first prompt tells the bot why it woke up, where
-its files are, any note its last run left, and how to schedule the next one:
+The folder is a git repository, because opencode only loads a folder's `AGENTS.md` and
+`.opencode/` agents in a project.
+
+Every run is a new opencode session. Its first prompt says why the bot woke up and passes on
+any note its last run left. Bots schedule themselves with:
 
 ```sh
 dumbot wake <bot> in 30m                     # or: in 2h, in 1d, at 09:00, at 2026-12-01 09:00
 dumbot wake <bot> every 6h --note "check the PR queue first"
 dumbot wake <bot> off
 dumbot list
+dumbot run <bot> [message]                   # start a run now, from a script or cron
 ```
 
 `dumbot wake` writes `bot.json`. The running app re-reads bots every few seconds and starts
@@ -43,11 +52,12 @@ starts.
 - A list of bots with their next wake-up or running status. **New bot** (⌘N) creates one and
   starts its first run, where it works out how to do its job and picks a schedule.
 - The bot's markdown files, rendered, refreshed as runs change them.
-- Each run's transcript: tool calls, permission requests to allow or reject, a composer to
+- Each run's model, token usage and cost, and its transcript: tool calls, permission requests to allow or reject, a composer to
   message the run, **Stop**, and **Open in terminal** (attaches the opencode TUI).
 - **Run now** (with the composer text as a message, if any), **Schedule…** by hand, and
   **Open folder** to edit files yourself.
-- A default model in **Settings**, and a model per bot.
+- A default model (bottom of the sidebar) and a model per bot. Changing either also switches
+  the bot's latest run, so a run that's working or that you message next uses it.
 
 ## Requirements
 
@@ -86,9 +96,9 @@ cargo run -- --snap out.png --scene demo --size 1440x900 --theme dark
 ```
 
 - `src/main.rs`: app state, the scheduler loop and all views.
-- `src/bots.rs`: bot folders, `bot.json`, and the run preamble.
+- `src/bots.rs`: bot folders, `bot.json`, the `dumbot` agent and starting runs.
 - `src/schedule.rs`: parsing and describing wake-up times.
-- `src/cli.rs`: `dumbot wake` and `dumbot list`.
+- `src/cli.rs`: `dumbot wake`, `run` and `list`.
 - `src/opencode.rs`: client for opencode's local HTTP API.
 - `src/store.rs`: app settings (`~/.local/share/dumbot/state.json`).
 - `src/update.rs`, `src/appbundle.rs`: self-update and the macOS app bundle.
