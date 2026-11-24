@@ -31,7 +31,7 @@ memory file and point to it.
 Commands you'd otherwise retype every run: fetching and parsing a page, calling an API,
 sending a notification. Write `scripts/<name>` (shell, Python, …) with a shebang line and a
 comment saying what it does and how to call it, `chmod +x` it, and run it by path. Scripts
-get your environment variables; use them by name (`$GOTIFY_TOKEN`), never write their values
+get your environment variables; use them by name (`$API_TOKEN`), never write their values
 into a script. Make scripts print plain, short results you can act on, and exit non-zero on
 failure.
 

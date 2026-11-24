@@ -1500,8 +1500,8 @@ fn env_dialog(s: &App, e: &EnvEdit, k: &Kit, layer: &mut Vec<El>) {
         );
     }
     let name = TextInput::new(&e.name)
-        .placeholder("GOTIFY_TOKEN")
-        .width(Some(200.0))
+        .placeholder("Name, e.g. API_TOKEN")
+        .width(None)
         .on_edit(|s: &mut App| &mut s.env_edit.as_mut().expect("dialog open").name)
         .on_submit(|s: &mut App, _| s.add_env())
         .build(k);
@@ -1538,13 +1538,9 @@ fn env_dialog(s: &App, e: &EnvEdit, k: &Kit, layer: &mut Vec<El>) {
         Some(desc),
         vec![
             rows,
-            row()
-                .w_full()
-                .gap(8.0)
-                .items_center()
-                .child(name)
-                .child(value.grow(1.0))
-                .child(add),
+            name,
+            value,
+            row().w_full().child(row().grow(1.0)).child(add),
         ],
         vec![done],
         k,
@@ -1610,7 +1606,7 @@ fn label(k: &Kit, t: &str) -> El {
 fn dialogs(s: &App, k: &Kit, layer: &mut Vec<El>) {
     if let Some(t) = &s.instructions {
         let area = TextArea::new(t)
-            .placeholder("e.g. I have Gotify at https://gotify.example.com: to notify me, POST to /message with the token in $GOTIFY_TOKEN.")
+            .placeholder("What every bot should know: services you run and how to use them, which environment variables hold what, your time zone, house rules…")
             .auto_grow(10, 24)
             .width(None)
             .on_edit(|s: &mut App| s.instructions.as_mut().expect("dialog open"))
@@ -1888,21 +1884,20 @@ fn main() {
                 demo(s);
                 let mut e = EnvEdit::open(Some("inbox-triager".into()));
                 e.env = env::Env::default();
-                e.env.global.insert("GOTIFY_TOKEN".into(), "x".into());
-                e.env.global.insert("GOTIFY_URL".into(), "x".into());
+                e.env.global.insert("API_TOKEN".into(), "x".into());
+                e.env.global.insert("SERVICE_URL".into(), "x".into());
                 e.env
                     .scope(Some("inbox-triager"))
                     .insert("GMAIL_LABEL".into(), "x".into());
                 e.env
                     .scope(Some("inbox-triager"))
-                    .insert("GOTIFY_URL".into(), "y".into());
+                    .insert("SERVICE_URL".into(), "y".into());
+                e.value = TextEdit::new("x".repeat(400));
                 s.env_edit = Some(e);
             }),
             ("instructions", |s: &mut App| {
                 demo(s);
-                s.instructions = Some(TextEdit::new(
-                    "I have Gotify at https://gotify.example.com. To notify me, POST to /message with the token in $GOTIFY_TOKEN.\n\nI'm in US Eastern time.",
-                ));
+                s.instructions = Some(TextEdit::new("I'm in US Eastern time."));
             }),
             ("weekly", |s: &mut App| {
                 demo(s);
