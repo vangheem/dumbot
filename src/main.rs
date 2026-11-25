@@ -1078,7 +1078,7 @@ fn sidebar(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
 fn main_pane(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     let (Some(slug), Some(bot)) = (s.selected.clone(), s.bot()) else {
         let msg = if s.bots.is_empty() {
-            "Create a bot to get started (⌘N). Describe what it's for; it writes its own instructions and decides when to run. With browse set up in opencode, bots can use your browser, logged in as you: most useful bots need it."
+            "Create a bot to get started (⌘N). Describe what it's for; it writes its own instructions and decides when to run. With opencode Browse (opencode.ai/product/browse) set up, bots can use your browser, logged in as you: most useful bots need it."
         } else {
             "Pick a bot."
         };

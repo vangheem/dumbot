@@ -94,31 +94,34 @@ next starts.
 ## Browser automation with browse
 
 Most useful bots work on websites: your email, a fantasy league, a store, an admin
-dashboard. Many of those sites have no API, or need you logged in. **browse** is what makes
-those bots possible. It's an MCP server that drives your real Chrome-family browser, with
-your logins, cookies and extensions, through the browse browser extension. A bot can open a
-tab, read the page, click, fill in forms and take screenshots as you would, and you can watch
-it work or take over (for a login, 2FA or a captcha).
+dashboard. Many of those sites have no API, or need you logged in.
+[**Browse**](https://opencode.ai/product/browse) from opencode is what makes those bots
+possible. It's an MCP server and a Chromium extension that let agents use your real browser
+(Chrome, Edge, Brave, Arc and others), with your tabs, logins and extensions. Agents open tabs
+in the background, in collapsed groups out of your way, and read pages, click, type and take
+screenshots. When it's your turn (a login, 2FA or a payment), they hand the tab back to you
+and continue once you click Continue.
 
 dumBot builds on it:
 
-- Every bot's instructions tell it to use the browse tools for anything in a browser, and to
+- Every bot's instructions tell it to use the browse tools for anything on a website, and to
   write down what it learns about a site (URLs, page layout, what to click) in its
   `AGENTS.md`, so later runs go straight to the right page.
 - Subagents each open their own tabs, so a bot can research several pages at once.
 - Bots can turn browser routines into skills and scripts that later runs reuse.
 
-To set it up, add the browse extension from the
-[Chrome Web Store](https://chromewebstore.google.com/detail/mfnicocicmmlkpjnaffgihfjhdgjkdjg),
-then run `browse install` and pick opencode. That adds browse to opencode's MCP servers and
-pairs the extension; `browse status` checks it. Bots without browse still work, but only
-with what the shell and simple web fetches can reach.
+To set it up, install the
+[browse extension](https://chromewebstore.google.com/detail/mfnicocicmmlkpjnaffgihfjhdgjkdjg)
+from the Chrome Web Store; it walks you through the rest, including adding browse to opencode.
+See [opencode.ai/product/browse](https://opencode.ai/product/browse) for details and
+[github.com/anomalyco/browse](https://github.com/anomalyco/browse) for the source. Bots
+without browse still work, but only with what the shell and simple web fetches can reach.
 
 ## Requirements
 
 - [`opencode`](https://opencode.ai) v2. dumBot uses opencode's shared background service
   (the one the TUI uses) and starts it when it isn't running.
-- Strongly recommended: [browse](#browser-automation-with-browse), so bots can use your browser.
+- Strongly recommended: [Browse](https://opencode.ai/product/browse) from opencode, so bots can use your browser ([how dumBot uses it](#browser-automation-with-browse)).
 
 ## Install
 
