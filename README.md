@@ -6,7 +6,7 @@
 
 A native desktop app for running your own bots, like a local Grok bot, powered by
 [opencode](https://opencode.ai) and a folder of markdown files. Built with
-[Rune](https://github.com/anomalyco/rune) (through [a fork](https://github.com/vangheem/rune)),
+[Rune](https://github.com/anomalyco/rune),
 like [gitsnack](https://github.com/vangheem/gitsnack).
 
 A bot is a folder of markdown. You give it a name and a purpose. It writes its own
