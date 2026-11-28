@@ -21,6 +21,7 @@ Each bot lives in `~/.local/share/dumbot/bots/<slug>/`:
 - `AGENTS.md`: who the bot is and how it works. Runs use the bot's folder as their working
   directory, so opencode loads it into every session. The bot rewrites it as it learns.
 - `memory/*.md`: everything else it keeps (notes, logs, to-dos, things already handled).
+- `files/`: files you uploaded for it to use (documents, data, references).
 - `bot.json`: dumBot's record of the bot's model, schedule and runs.
 - `.opencode/`: what dumBot writes before every run (from `src/prompts/`):
   - `agents/dumbot.md`: the agent every run uses. Its system prompt is the bot's operating
@@ -105,18 +106,63 @@ Every run happens in the bot's own Docker container (`dumbot-<slug>`), running
   with its log, a container that stopped, a tool that isn't logged in on the host, …).
   `dumbot doctor` prints the same.
 
+## Bots on a server
+
+The app can manage bots that run on another machine (a home server, a VPS), which runs them on
+schedule while your computer is off or the app is closed.
+
+```sh
+# On the server (Linux with systemd, or macOS), with Docker:
+dumbot install-server          # runs `dumbot server` now and at boot (port 7457)
+dumbot server approve <code>   # pairs an app (the app shows the code)
+dumbot server clients          # paired apps; `dumbot server revoke <fingerprint>` unpairs
+```
+
+In the app, **Server…** (bottom of the sidebar) connects to it (or `dumbot connect <host>`).
+
+- **Pairing**: each machine has its own key and self-signed certificate. The first time an app
+  connects, the server doesn't know it; the app shows a code made from both keys, which you
+  approve on the server with `dumbot server approve <code>`. From then on all traffic is TLS
+  between those two keys only: the app pins the server's, the server only answers approved
+  apps. Someone in the middle would change a key, so the codes wouldn't match.
+- **Moving bots**: once paired, the app offers to move this computer's bots there (their
+  folders, schedules, settings and own variables; not their run history).
+- **Your setup**: bots on a server use your computer's opencode config (models, agents,
+  skills, MCP servers), logins, opencode version, GitHub CLI token, git identity and time
+  zone, which the app sends when it connects and every 10 minutes. The server keeps the latest
+  (owner-only) for runs while the app is closed.
+- **Browse** is carried back to your computer: the server listens on your relay's port on its
+  loopback and the app tunnels each connection (over the same TLS) to your browse relay, so
+  bots on the server use your browser, and hand tabs back to you, while the app is open.
+
+## MCP servers for bots
+
+Besides the MCP servers in your opencode config (turned on per bot under **Container…**),
+bots can have MCP servers of their own, in opencode's `mcp` format: for every bot (**MCP
+servers for bots** in the sidebar) or one bot (**Container…**). They're kept in
+`~/.local/share/dumbot/mcp.json` (owner-only) where the bots run, and only bots get them.
+
+Bots can also install MCP servers for themselves: `dumbot mcp <bot> add <name> --url …` or
+`… add <name> -- npx -y <package>`, kept in the bot's `mcp.json` and on from its next run
+(its container restarts opencode with them). Values can use `{env:NAME}` for the bot's
+environment variables, filled in when dumBot writes the bot's opencode config, which bots
+aren't allowed to read. The image has Node.js (npx) and uv (uvx); what a bot installs
+itself (`npm install -g`, `pip install --user`, `uv tool install`) goes to its home, which
+outlives its container.
+
 ## Features
 
 - A list of bots with their next wake-up or running status. **New bot** (⌘N) creates one and
   starts its first run, where it works out how to do its job and picks a schedule.
 - The bot's markdown files, rendered, refreshed as runs change them.
 - Each run's model, token usage and cost, and its transcript: tool calls, permission requests to allow or reject, a composer to
-  message the run, **Stop**, and **Open in terminal** (attaches the opencode TUI).
+  message the run, and **Stop**.
 - A **Schedule** tab listing each wake-up (a one-off, an interval, each weekly rule) with its
   next time and note, to remove any of them or add one: once on a day and time, weekly on
   chosen days, or repeating every so many minutes, hours or days.
-- **Run now** (with the composer text as a message, if any), and **Open folder** to edit
-  files yourself.
+- **Run now** (with the composer text as a message, if any).
+- **Upload files…** / **Upload folder…** (or drop them on the bot) copy files into the bot's
+  `files/`, wherever it runs, for it to use and refer to; the Files tab lists them.
 - A default model (bottom of the sidebar) and a model per bot. Changing either also switches
   the bot's latest run, so a run that's working or that you message next uses it.
 
@@ -161,8 +207,11 @@ dumbot install-app        # optional: ~/Applications/dumbot.app (macOS)
 ```
 
 Prebuilt binaries are on the [releases page](https://github.com/vangheem/dumbot/releases),
-and `make install` builds from source into `~/.local/bin`. dumBot checks for new releases
-and offers **Update and restart** for Homebrew installs.
+and `make install` builds from source into `~/.local/bin`. The app checks GitHub for new
+releases every few hours and offers **Update and restart** (through Homebrew for Homebrew
+installs; otherwise it downloads the release, checks its SHA-256 and replaces itself). A
+server installed with `dumbot install-server` updates itself: it installs each new release
+and restarts (`DUMBOT_NO_AUTO_UPDATE=1` in its service turns that off).
 
 ## Releasing
 
@@ -180,16 +229,22 @@ make run
 make test
 make lint
 cargo test -- --ignored        # also hits the local opencode service and GitHub
+DUMBOT_DATA_DIR=/tmp/c cargo test remote_bot -- --ignored   # a bot on a paired server
 cargo build --no-default-features   # the command line only, as built into the image
 cargo run -- --snap out.png --scene demo --size 1440x900 --theme dark
 ```
 
-- `src/main.rs`: app state, the scheduler loop and all views.
+- `src/app.rs`: app state, the scheduler loop and all views.
 - `src/bots.rs`: bot folders, `bot.json`, the `dumbot` agent and starting runs.
 - `src/schedule.rs`: parsing and describing wake-up times.
 - `src/cli.rs`: `dumbot wake`, `run` and `list`.
 - `src/container.rs`: the image, bots' containers, pausing, and `dumbot doctor`.
 - `src/opencode.rs`: client for opencode's HTTP API (in each bot's container).
+- `src/api.rs`: every request the app makes, handled in-process or by a server.
+- `src/remote.rs`, `src/server.rs`, `src/tunnel.rs`: pairing and TLS, `dumbot server` and
+  its service, and carrying browse back to the app.
+- `src/context.rs`: what a server's bots take from the app's computer.
+- `src/mcp.rs`: bot-only MCP servers.
 - `src/store.rs`: app settings (`~/.local/share/dumbot/state.json`).
 - `src/update.rs`, `src/appbundle.rs`: self-update and the macOS app bundle.
 

@@ -16,10 +16,12 @@ use rune_kit::{
     IconButton, IconButtonVariant, Kit, Markdown, SegmentedControl, Spinner, TextArea, TextInput,
 };
 
+use crate::api::{self, Backend, Change, Request, SessionAction};
 use crate::bots::{self, Bot, Run};
-use crate::opencode::{Client, Entry, Snapshot};
+use crate::opencode::{Entry, Snapshot};
+use crate::remote::{self, Server};
 use crate::store::{ModelRef, Store};
-use crate::{appbundle, container, env, opencode, schedule, store, update};
+use crate::{appbundle, container, env, mcp, opencode, schedule, update};
 
 type Job = Box<dyn FnOnce(&mut App, &mut Tx) + Send>;
 
@@ -31,6 +33,8 @@ enum Confirm {
     InstallApp,
     Update,
     Delete(String),
+    /// Move these local bots to the server just connected to.
+    MoveBots(Vec<String>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -82,16 +86,32 @@ struct EnvEdit {
 }
 
 impl EnvEdit {
-    fn open(bot: Option<String>) -> EnvEdit {
+    fn open(bot: Option<String>, env: env::Env) -> EnvEdit {
         let mut name = TextEdit::new("");
         name.focused = true;
         EnvEdit {
             bot,
-            env: env::load(),
+            env,
             name,
             value: TextEdit::new(""),
         }
     }
+}
+
+/// The Server dialog: where bots run, and pairing with a server.
+struct ConnectEdit {
+    addr: TextEdit,
+    /// The server being paired with, pinned to the certificate it showed.
+    pinned: Option<Server>,
+    /// The code to approve on the server, once it asked for one.
+    code: Option<String>,
+    busy: bool,
+    error: Option<String>,
+}
+
+/// The bot-only MCP servers for all bots, as JSON, being edited.
+struct McpEdit {
+    text: TextEdit,
 }
 
 /// A bot start's lifecycle: each step and when it began, then when it ended and how.
@@ -108,20 +128,46 @@ struct SandboxEdit {
     mounts: TextEdit,
     /// The host's MCP servers, with why each may not work in a container.
     servers: Vec<(String, Option<String>)>,
+    /// MCP servers only this bot gets, as JSON.
+    own_mcp: TextEdit,
+    /// Names of the bot-only servers every bot gets.
+    global_mcp: Vec<String>,
 }
 
 /// How long an idle container stays unpaused, in seconds.
 const PAUSE_AFTER_SECS: f64 = 60.0;
 /// How often issues are checked, in seconds.
 const DOCTOR_SECS: f64 = 60.0;
+/// How often a server is sent this computer's opencode config and logins, in seconds.
+const CONTEXT_PUSH_SECS: f64 = 600.0;
+
+/// Servers as the JSON the MCP editors show.
+fn servers_json(s: &mcp::Servers) -> String {
+    if s.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string_pretty(s).unwrap_or_default()
+    }
+}
 
 struct App {
     store: Store,
     jobs: (Sender<Job>, Receiver<Job>),
     waker: Option<Waker>,
-    /// The host's opencode service, only for listing models when no container is up.
-    oc: Option<Client>,
-    oc_connecting: bool,
+    /// Where bots live: this computer, or a dumBot server.
+    backend: Backend,
+    /// The default model for bots (the server's, when connected to one).
+    default_model: Option<ModelRef>,
+    /// Bots the server is starting runs of (scheduled ones), with the step each is on.
+    server_starting: BTreeMap<String, String>,
+    /// Why the server can't be reached, if it can't.
+    server_error: Option<String>,
+    connect: Option<ConnectEdit>,
+    next_pair: f64,
+    next_context_push: f64,
+    mcp_edit: Option<McpEdit>,
+    moving: bool,
+    next_models: f64,
     /// Each bot's container state (`running`, `paused`, …), from the last scan.
     containers: HashMap<String, String>,
     /// When each bot last had a reason to keep its container unpaused (app clock).
@@ -180,12 +226,21 @@ struct App {
 }
 
 fn init() -> App {
+    let store = Store::load();
     App {
-        store: Store::load(),
+        backend: store.remote.clone().map_or(Backend::Local, Backend::Remote),
+        default_model: store.model.clone(),
+        store,
         jobs: channel(),
         waker: None,
-        oc: None,
-        oc_connecting: false,
+        server_starting: BTreeMap::new(),
+        server_error: None,
+        connect: None,
+        next_pair: 0.0,
+        next_context_push: 0.0,
+        mcp_edit: None,
+        moving: false,
+        next_models: 0.0,
         containers: HashMap::new(),
         last_busy: HashMap::new(),
         progress: HashMap::new(),
@@ -280,46 +335,33 @@ impl App {
             .is_some_and(|id| self.active.contains(id))
     }
 
-    /// The host's opencode service once connected (for listing models); starts connecting
-    /// in the background otherwise. Runs never use it.
-    fn host_client(&mut self) -> Option<Client> {
-        if self.oc.is_none() && !self.oc_connecting {
-            self.oc_connecting = true;
-            self.bg(Client::connect, |s, res, tx| {
-                s.oc_connecting = false;
-                if let Ok(c) = res {
-                    s.oc = Some(c);
-                    tx.wake_after(Duration::from_millis(1));
-                }
-            });
+    fn wake(&self) {
+        if let Some(w) = &self.waker {
+            w();
         }
-        self.oc.clone()
     }
 
-    /// Runs `work` with the bot's container client (resuming a paused container first), or the
-    /// host's opencode service when the bot has no container.
-    fn with_bot<T: Send + 'static>(
-        &self,
-        slug: &str,
-        work: impl FnOnce(&Client) -> anyhow::Result<T> + Send + 'static,
-        done: impl FnOnce(&mut App, anyhow::Result<T>, &mut Tx) + Send + 'static,
-    ) {
-        let slug = slug.to_string();
-        let state = self.containers.get(&slug).cloned();
-        let host = self.oc.clone();
-        self.bg(
-            move || match state.as_deref() {
-                // Runs from before bots ran in containers are in the host's opencode.
-                None => work(&host.map_or_else(Client::connect, Ok)?),
-                Some(st) => {
-                    if st == "paused" {
-                        container::resume(&slug)?;
-                    }
-                    work(&container::client(&slug)?)
-                }
-            },
-            done,
-        );
+    /// Whether a bot's run is being started, here or by the server.
+    fn is_starting(&self, slug: &str) -> bool {
+        self.starting.contains(slug) || self.server_starting.contains_key(slug)
+    }
+
+    /// Changes a bot where it lives, returning it as changed.
+    fn update_bot(&mut self, slug: &str, change: Change) -> Option<Bot> {
+        let req = Request::UpdateBot {
+            slug: slug.into(),
+            change,
+        };
+        match self.backend.call::<Bot>(req) {
+            Ok(b) => {
+                self.bots.insert(slug.into(), b.clone());
+                Some(b)
+            }
+            Err(e) => {
+                self.notify(format!("{e:#}"), true);
+                None
+            }
+        }
     }
 
     /// A function a background start reports its steps through.
@@ -372,11 +414,28 @@ impl App {
     }
 
     fn reload_files(&mut self) {
-        let Some(slug) = &self.selected else {
+        let Some(slug) = self.selected.clone() else {
             self.files.clear();
             return;
         };
-        let files = bots::files(slug);
+        let backend = self.backend.clone();
+        self.bg(
+            move || {
+                let files =
+                    backend.call::<Vec<(String, String)>>(Request::Files { slug: slug.clone() });
+                (slug, files)
+            },
+            |s, (slug, res), _| {
+                if let Ok(files) = res
+                    && s.selected.as_ref() == Some(&slug)
+                {
+                    s.set_files(files);
+                }
+            },
+        );
+    }
+
+    fn set_files(&mut self, files: Vec<(String, String)>) {
         if files != self.files {
             self.files = files;
         }
@@ -389,9 +448,16 @@ impl App {
         }
     }
 
-    /// Re-reads every bot from disk.
+    /// Re-reads every bot: at once from disk, or soon from the server.
     fn reload_bots(&mut self) {
-        let bots = bots::list();
+        if self.backend.is_remote() {
+            self.next_scan = 0.0;
+            return self.wake();
+        }
+        self.apply_bots(bots::list());
+    }
+
+    fn apply_bots(&mut self, bots: BTreeMap<String, Bot>) {
         if bots != self.bots {
             self.bots = bots;
         }
@@ -436,25 +502,23 @@ impl App {
         notes: Vec<String>,
         message: Option<String>,
     ) {
-        let Some(bot) = self.bots.get(&slug).cloned() else {
+        if !self.bots.contains_key(&slug) {
             return;
-        };
-        let default = self.store.model.clone();
+        }
         self.starting.insert(slug.clone());
         self.progress.insert(slug.clone(), Progress::default());
         let s2 = slug.clone();
         let step = self.stepper(&slug);
+        let backend = self.backend.clone();
         self.bg(
             move || -> anyhow::Result<String> {
-                bots::start_run(
-                    &s2,
-                    &bot,
-                    &reason,
-                    &notes,
-                    message.as_deref(),
-                    default,
-                    &step,
-                )
+                let req = Request::StartRun {
+                    slug: s2,
+                    reason,
+                    notes,
+                    message,
+                };
+                backend.call_with(req, &step)
             },
             move |s, res, tx| {
                 s.starting.remove(&slug);
@@ -504,19 +568,22 @@ impl App {
         }
         self.composer = TextEdit::new("");
         self.busy = true;
-        self.session_call(move |oc, id| oc.prompt(id, &text));
+        self.session_call(SessionAction::Prompt { text });
     }
 
-    fn session_call(
-        &mut self,
-        f: impl FnOnce(&Client, &str) -> anyhow::Result<()> + Send + 'static,
-    ) {
-        let (Some(slug), Some(id)) = (self.selected.clone(), self.session_id()) else {
+    fn session_call(&mut self, action: SessionAction) {
+        let (Some(slug), Some(session)) = (self.selected.clone(), self.session_id()) else {
             return;
         };
-        self.with_bot(
-            &slug,
-            move |oc| f(oc, &id),
+        let backend = self.backend.clone();
+        self.bg(
+            move || {
+                backend.call::<()>(Request::Session {
+                    slug,
+                    session,
+                    action,
+                })
+            },
             |s, res, tx| {
                 s.busy = false;
                 s.next_chat_poll = 0.0;
@@ -530,26 +597,13 @@ impl App {
     }
 
     /// Models from a running container (they share the host's opencode config), or the
-    /// host's opencode service.
-    fn load_models(&mut self, oc: Option<Client>) {
-        let running: Vec<String> = self
-            .containers
-            .iter()
-            .filter(|(_, st)| *st == "running")
-            .map(|(slug, _)| slug.clone())
-            .collect();
+    /// host's opencode service. Tried again a little later while neither is up.
+    fn load_models(&mut self) {
         self.models_loading = true;
+        let backend = self.backend.clone();
         self.bg(
-            move || {
-                for slug in running {
-                    if let Ok(list) = container::client(&slug).and_then(|c| c.models()) {
-                        return Ok(list);
-                    }
-                }
-                oc.ok_or_else(|| anyhow::anyhow!("no bot container is running yet"))?
-                    .models()
-            },
-            |s, res, _| {
+            move || backend.call::<Vec<(String, String, String)>>(Request::Models),
+            |s, res, tx| {
                 s.models_loading = false;
                 match res {
                     Ok(list) => {
@@ -562,7 +616,10 @@ impl App {
                             })
                             .collect();
                     }
-                    Err(e) => s.notify(format!("Couldn't list opencode models: {e}"), true),
+                    Err(_) => {
+                        s.next_models = tx.clock() + 15.0;
+                        tx.wake_after(Duration::from_secs(15));
+                    }
                 }
             },
         );
@@ -577,10 +634,23 @@ impl App {
     }
 
     fn choose_default_model(&mut self, key: &str) {
-        self.store.model = ModelRef::parse(key);
-        self.save();
+        self.default_model = ModelRef::parse(key);
+        if self.backend.is_remote() {
+            let (backend, model) = (self.backend.clone(), self.default_model.clone());
+            self.bg(
+                move || backend.call::<()>(Request::SetDefaultModel { model }),
+                |s, res, _| {
+                    if let Err(e) = res {
+                        s.notify(format!("Couldn't save the default model: {e:#}"), true);
+                    }
+                },
+            );
+        } else {
+            self.store.model = self.default_model.clone();
+            self.save();
+        }
         // Bots on the default model switch their latest run too.
-        let Some(m) = self.store.model.clone() else {
+        let Some(m) = self.default_model.clone() else {
             return;
         };
         let sessions: Vec<(String, String)> = self
@@ -604,11 +674,16 @@ impl App {
         if sessions.is_empty() {
             return;
         }
+        let backend = self.backend.clone();
         self.bg(
             move || {
-                sessions
-                    .iter()
-                    .try_for_each(|(slug, id)| container::client(slug)?.set_model(id, &m))
+                sessions.into_iter().try_for_each(|(slug, session)| {
+                    backend.call::<()>(Request::Session {
+                        slug,
+                        session,
+                        action: SessionAction::SetModel { model: m.clone() },
+                    })
+                })
             },
             |s, res, _| {
                 s.next_chat_poll = 0.0;
@@ -625,29 +700,38 @@ impl App {
             return;
         };
         let model = ModelRef::parse(key);
-        match bots::update(&slug, |b| b.model = model) {
-            Ok(b) => {
-                let effective = b.model.clone().or_else(|| self.store.model.clone());
-                if let (Some(id), Some(m)) = (b.last_session(), effective) {
-                    self.switch_model(vec![(slug.clone(), id.to_string())], m);
-                }
-                self.bots.insert(slug, b);
+        if let Some(b) = self.update_bot(&slug, Change::Model(model)) {
+            let effective = b.model.clone().or_else(|| self.default_model.clone());
+            if let (Some(id), Some(m)) = (b.last_session(), effective) {
+                self.switch_model(vec![(slug, id.to_string())], m);
             }
-            Err(e) => self.notify(e.to_string(), true),
         }
     }
 
     fn create_bot(&mut self) {
-        let Some((name, purpose)) = &self.new_bot else {
+        let Some((name, purpose)) = self
+            .new_bot
+            .as_ref()
+            .map(|(n, p)| (n.text.clone(), p.text.clone()))
+        else {
             return;
         };
-        if purpose.text.trim().is_empty() {
+        if purpose.trim().is_empty() {
             return self.notify("Describe what the bot is for.", true);
         }
-        match bots::create(&name.text, &purpose.text) {
+        let req = Request::Create {
+            name: name.clone(),
+            purpose,
+        };
+        match self.backend.call::<String>(req) {
             Ok(slug) => {
                 self.new_bot = None;
                 self.reload_bots();
+                // Known at once, so its run can start before the next scan.
+                self.bots.entry(slug.clone()).or_insert_with(|| Bot {
+                    name: name.trim().into(),
+                    ..Bot::default()
+                });
                 self.select(&slug);
                 self.start_run(
                     slug,
@@ -691,13 +775,14 @@ impl App {
             },
         };
         let note = Some(f.note.text.trim().to_string()).filter(|n| !n.is_empty());
-        match bots::update(&slug, |b| schedule::apply(b, sched, note, now)) {
-            Ok(b) => {
-                self.bots.insert(slug, b);
-                self.sched.note = TextEdit::new("");
-                self.next_scan = 0.0;
-            }
-            Err(e) => self.notify(format!("{e:#}"), true),
+        let change = Change::Schedule {
+            schedule: sched,
+            note,
+            now,
+        };
+        if self.update_bot(&slug, change).is_some() {
+            self.sched.note = TextEdit::new("");
+            self.next_scan = 0.0;
         }
     }
 
@@ -705,26 +790,42 @@ impl App {
         let Some(slug) = self.selected.clone() else {
             return;
         };
-        match bots::update(&slug, |b| schedule::remove(b, item)) {
-            Ok(b) => {
-                self.bots.insert(slug, b);
-            }
-            Err(e) => self.notify(format!("{e:#}"), true),
-        }
+        self.update_bot(&slug, Change::RemoveWakeup(item));
     }
 
     fn save_instructions(&mut self) {
         let Some(t) = self.instructions.take() else {
             return;
         };
-        match store::save_instructions(&t.text) {
+        match self.backend.call::<()>(Request::SaveInstructions {
+            text: t.text.clone(),
+        }) {
             Ok(()) => self.notify("Saved. Bots follow it from their next run.", false),
             Err(e) => self.notify(format!("Couldn't save: {e:#}"), true),
         }
     }
 
+    fn open_instructions(&mut self) {
+        match self.backend.call::<String>(Request::Instructions) {
+            Ok(text) => {
+                let mut t = TextEdit::new(text);
+                t.focused = true;
+                self.instructions = Some(t);
+            }
+            Err(e) => self.notify(format!("{e:#}"), true),
+        }
+    }
+
+    /// `None` for the global variables.
+    fn open_env(&mut self, bot: Option<String>) {
+        match self.backend.call::<env::Env>(Request::Env) {
+            Ok(e) => self.env_edit = Some(EnvEdit::open(bot, e)),
+            Err(e) => self.notify(format!("{e:#}"), true),
+        }
+    }
+
     fn add_env(&mut self) {
-        let Some(e) = &mut self.env_edit else { return };
+        let Some(e) = &self.env_edit else { return };
         let name = e.name.text.trim().to_string();
         if !env::valid_name(&name) {
             return self.notify(
@@ -735,34 +836,60 @@ impl App {
         if e.value.text.is_empty() {
             return self.notify("Enter a value.", true);
         }
-        let mut fresh = env::load();
-        fresh
-            .scope(e.bot.as_deref())
-            .insert(name, e.value.text.clone());
-        self.save_env(fresh);
+        let value = Some(e.value.text.clone());
+        self.set_env(name, value);
     }
 
     fn remove_env(&mut self, name: &str) {
-        let Some(e) = &self.env_edit else { return };
-        let mut fresh = env::load();
-        fresh.scope(e.bot.as_deref()).remove(name);
-        if let Some(b) = &e.bot
-            && fresh.bots.get(b).is_some_and(|v| v.is_empty())
-        {
-            fresh.bots.remove(b);
-        }
-        self.save_env(fresh);
+        self.set_env(name.to_string(), None);
     }
 
-    fn save_env(&mut self, fresh: env::Env) {
-        if let Err(err) = fresh.save() {
-            return self.notify(format!("Couldn't save: {err:#}"), true);
+    fn set_env(&mut self, name: String, value: Option<String>) {
+        let Some(e) = &self.env_edit else { return };
+        let req = Request::SetEnv {
+            bot: e.bot.clone(),
+            name,
+            value,
+        };
+        match self.backend.call::<env::Env>(req) {
+            Ok(fresh) => {
+                if let Some(e) = &mut self.env_edit {
+                    e.env = fresh;
+                    e.name = TextEdit::new("");
+                    e.name.focused = true;
+                    e.value = TextEdit::new("");
+                }
+            }
+            Err(err) => self.notify(format!("Couldn't save: {err:#}"), true),
         }
-        if let Some(e) = &mut self.env_edit {
-            e.env = fresh;
-            e.name = TextEdit::new("");
-            e.name.focused = true;
-            e.value = TextEdit::new("");
+    }
+
+    fn open_mcp(&mut self) {
+        match self.backend.call::<mcp::BotMcp>(Request::BotMcp) {
+            Ok(m) => {
+                self.mcp_edit = Some(McpEdit {
+                    text: TextEdit::new(servers_json(&m.global)),
+                })
+            }
+            Err(e) => self.notify(format!("{e:#}"), true),
+        }
+    }
+
+    fn save_mcp(&mut self) {
+        let Some(e) = &self.mcp_edit else { return };
+        let servers = match mcp::parse(&e.text.text) {
+            Ok(s) => s,
+            Err(err) => return self.notify(format!("{err:#}"), true),
+        };
+        match self
+            .backend
+            .call::<mcp::BotMcp>(Request::SaveBotMcp { bot: None, servers })
+        {
+            Ok(_) => {
+                self.mcp_edit = None;
+                self.notify("Saved. Bots get these from their next run.", false);
+            }
+            Err(err) => self.notify(format!("Couldn't save: {err:#}"), true),
         }
     }
 
@@ -775,6 +902,10 @@ impl App {
             .get(&slug)
             .map(|b| b.sandbox.clone())
             .unwrap_or_default();
+        let bot_mcp = match self.backend.call::<mcp::BotMcp>(Request::BotMcp) {
+            Ok(m) => m,
+            Err(e) => return self.notify(format!("{e:#}"), true),
+        };
         let mut servers: Vec<(String, Option<String>)> = container::host_mcp()
             .into_iter()
             .filter(|(name, _)| name != "browse")
@@ -786,18 +917,40 @@ impl App {
                 servers.push((m.clone(), Some("isn't in your opencode config".into())));
             }
         }
+        let slug_for_mcp = slug.clone();
         self.sandbox_edit = Some(SandboxEdit {
             slug,
             mounts: TextEdit::new(sandbox.mounts.join("\n")),
             sandbox,
             servers,
+            own_mcp: TextEdit::new(servers_json(
+                bot_mcp
+                    .bots
+                    .get(&slug_for_mcp)
+                    .unwrap_or(&mcp::Servers::new()),
+            )),
+            global_mcp: bot_mcp.global.keys().cloned().collect(),
         });
     }
 
     fn save_sandbox(&mut self) {
+        let Some(own) = self.sandbox_edit.as_ref().map(|e| e.own_mcp.text.clone()) else {
+            return;
+        };
+        let own = match mcp::parse(&own) {
+            Ok(s) => s,
+            Err(err) => return self.notify(format!("This bot's MCP servers: {err:#}"), true),
+        };
         let Some(e) = self.sandbox_edit.take() else {
             return;
         };
+        let req = Request::SaveBotMcp {
+            bot: Some(e.slug.clone()),
+            servers: own,
+        };
+        if let Err(err) = self.backend.call::<mcp::BotMcp>(req) {
+            return self.notify(format!("Couldn't save: {err:#}"), true);
+        }
         let mut sandbox = e.sandbox;
         sandbox.mounts = e
             .mounts
@@ -807,61 +960,246 @@ impl App {
             .filter(|l| !l.is_empty())
             .map(str::to_string)
             .collect();
-        match bots::update(&e.slug, |b| b.sandbox = sandbox) {
-            Ok(b) => {
-                self.bots.insert(e.slug, b);
-                self.next_doctor = 0.0;
-                self.notify(
-                    "Saved. The bot's next run uses its new container settings.",
-                    false,
-                );
-            }
-            Err(err) => self.notify(format!("{err:#}"), true),
+        if self.update_bot(&e.slug, Change::Sandbox(sandbox)).is_some() {
+            self.next_doctor = 0.0;
+            self.notify(
+                "Saved. The bot's next run uses its new container settings.",
+                false,
+            );
         }
     }
 
     fn delete_bot(&mut self, slug: &str) {
         self.confirm = None;
-        if let Err(e) = bots::delete(slug) {
+        if let Err(e) = self
+            .backend
+            .call::<()>(Request::Delete { slug: slug.into() })
+        {
             self.notify(format!("{e:#}"), true);
         }
         self.reload_bots();
     }
 
-    fn open_folder(&mut self) {
-        if let Some(slug) = &self.selected
-            && let Err(e) = std::process::Command::new("open")
-                .arg(bots::dir(slug))
-                .spawn()
-        {
-            self.notify(format!("Couldn't open the folder: {e}"), true);
+    /// Asks for files, or a folder, to upload to the selected bot.
+    fn pick_upload(&mut self, tx: &mut Tx, folder: bool) {
+        let Some(slug) = self.selected.clone() else {
+            return;
+        };
+        let options = rune::FileDialogOptions {
+            title: "Upload to the bot".into(),
+            ..Default::default()
+        };
+        if folder {
+            tx.open_folder(options, move |s: &mut App, res, _| match res {
+                Ok(Some(p)) => s.upload(slug, vec![p]),
+                Ok(None) => {}
+                Err(e) => s.notify(format!("Couldn't choose a folder: {}", e.0), true),
+            });
+        } else {
+            tx.open_files(options, move |s: &mut App, res, _| match res {
+                Ok(Some(paths)) => s.upload(slug, paths),
+                Ok(None) => {}
+                Err(e) => s.notify(format!("Couldn't choose files: {}", e.0), true),
+            });
         }
     }
 
-    /// Opens the run in the opencode TUI, attached to the bot's container.
-    fn open_terminal(&mut self) {
-        let (Some(slug), Some(id)) = (self.selected.clone(), self.session_id()) else {
+    /// Copies files and folders into the bot's `files/`, where it lives.
+    fn upload(&mut self, slug: String, paths: Vec<std::path::PathBuf>) {
+        if paths.is_empty() {
             return;
+        }
+        self.busy = true;
+        let backend = self.backend.clone();
+        self.bg(
+            move || {
+                let files = api::collect_upload(&paths)?;
+                let n = files.len();
+                backend.call::<()>(Request::Upload { slug, files })?;
+                Ok::<_, anyhow::Error>(n)
+            },
+            |s, res, _| {
+                s.busy = false;
+                match res {
+                    Ok(n) => {
+                        s.reload_files();
+                        s.notify(
+                            format!(
+                                "Uploaded {n} file{} to the bot's files/.",
+                                if n == 1 { "" } else { "s" }
+                            ),
+                            false,
+                        );
+                    }
+                    Err(e) => s.notify(format!("Couldn't upload: {e:#}"), true),
+                }
+            },
+        );
+    }
+
+    fn open_connect(&mut self) {
+        let addr = match &self.backend {
+            Backend::Remote(s) => s.addr.clone(),
+            Backend::Local => String::new(),
         };
-        let dir = bots::dir(&slug);
-        let s2 = slug.clone();
-        self.with_bot(
-            &slug,
-            move |_| container::attach_command(&s2, &id),
-            move |s, res, _| {
-                let res = res.and_then(|attach| {
-                    let cmd = format!("cd '{}' && {attach}", dir.display());
-                    let script = format!(
-                        "tell application \"Terminal\"\nactivate\ndo script \"{}\"\nend tell",
-                        cmd.replace('\\', "\\\\").replace('"', "\\\"")
-                    );
-                    std::process::Command::new("osascript")
-                        .args(["-e", &script])
-                        .spawn()?;
-                    Ok(())
-                });
+        let mut addr = TextEdit::new(addr);
+        addr.focused = true;
+        self.connect = Some(ConnectEdit {
+            addr,
+            pinned: None,
+            code: None,
+            busy: false,
+            error: None,
+        });
+    }
+
+    /// Asks the server in the dialog to pair, or whether it has approved this app yet.
+    fn try_connect(&mut self) {
+        let Some(c) = &mut self.connect else { return };
+        if c.busy {
+            return;
+        }
+        let addr = c.addr.text.trim();
+        if addr.is_empty() {
+            c.error = Some("Enter the server's address.".into());
+            return;
+        }
+        let addr = remote::normalize_addr(addr);
+        // A different address starts over.
+        if c.pinned.as_ref().is_some_and(|p| p.addr != addr) {
+            c.pinned = None;
+            c.code = None;
+        }
+        let server = c.pinned.clone().unwrap_or(Server {
+            addr,
+            fingerprint: None,
+        });
+        c.busy = true;
+        c.error = None;
+        self.bg(
+            move || server.pair(),
+            |s, res, tx| {
+                let Some(c) = &mut s.connect else { return };
+                c.busy = false;
+                match res {
+                    Ok((pinned, Some(code))) => {
+                        c.pinned = Some(pinned);
+                        c.code = Some(code);
+                        s.next_pair = tx.clock() + 2.0;
+                        tx.wake_after(Duration::from_secs(2));
+                    }
+                    Ok((pinned, None)) => s.connected(pinned),
+                    Err(e) => c.error = Some(format!("{e:#}")),
+                }
+            },
+        );
+    }
+
+    /// Paired: bots are the server's from now on. Offers to move this computer's bots there.
+    fn connected(&mut self, server: Server) {
+        self.connect = None;
+        self.store.remote = Some(server.clone());
+        self.save();
+        let addr = server.addr.clone();
+        self.switch_backend(Backend::Remote(server));
+        self.notify(format!("Connected to {addr}."), false);
+        let local: Vec<String> = bots::list().into_keys().collect();
+        if !local.is_empty() {
+            self.confirm = Some(Confirm::MoveBots(local));
+        }
+    }
+
+    fn disconnect(&mut self) {
+        self.connect = None;
+        self.store.remote = None;
+        self.save();
+        self.switch_backend(Backend::Local);
+        self.notify("Bots run on this computer again.", false);
+    }
+
+    fn switch_backend(&mut self, backend: Backend) {
+        self.default_model = match &backend {
+            Backend::Local => self.store.model.clone(),
+            Backend::Remote(_) => None,
+        };
+        crate::tunnel::carry(match &backend {
+            Backend::Remote(s) => Some(s.clone()),
+            Backend::Local => None,
+        });
+        self.backend = backend;
+        self.bots.clear();
+        self.selected = None;
+        self.files.clear();
+        self.file = None;
+        self.run = None;
+        self.containers.clear();
+        self.active.clear();
+        self.chats.clear();
+        self.progress.clear();
+        self.server_starting.clear();
+        self.server_error = None;
+        self.issues.clear();
+        self.models.clear();
+        self.next_models = 0.0;
+        self.next_scan = 0.0;
+        self.next_doctor = 0.0;
+        self.next_context_push = 0.0;
+        self.wake();
+    }
+
+    /// Sends the server what its bots take from this computer (see `context`).
+    fn push_context(&mut self) {
+        if !self.backend.is_remote() {
+            return;
+        }
+        let backend = self.backend.clone();
+        self.bg(
+            move || {
+                backend.call::<()>(Request::SyncContext {
+                    context: crate::context::gather(),
+                })
+            },
+            |s, res, _| {
                 if let Err(e) = res {
-                    s.notify(format!("Couldn't open Terminal: {e:#}"), true);
+                    s.notify(
+                        format!("Couldn't send your opencode config to the server: {e:#}"),
+                        true,
+                    );
+                }
+            },
+        );
+    }
+
+    /// Copies local bots to the server, removing each here once the server has it.
+    fn move_bots(&mut self, slugs: Vec<String>) {
+        self.confirm = None;
+        self.moving = true;
+        let backend = self.backend.clone();
+        self.bg(
+            move || {
+                let mut moved = 0;
+                let mut failed = Vec::new();
+                for slug in slugs {
+                    let res = api::export(&slug)
+                        .and_then(|req| backend.call::<()>(req))
+                        .and_then(|_| bots::delete(&slug));
+                    match res {
+                        Ok(()) => moved += 1,
+                        Err(e) => failed.push(format!("{slug}: {e:#}")),
+                    }
+                }
+                (moved, failed)
+            },
+            |s, (moved, failed), _| {
+                s.moving = false;
+                s.reload_bots();
+                if failed.is_empty() {
+                    s.notify(format!("Moved {moved} bot(s) to the server."), false);
+                } else {
+                    s.notify(
+                        format!("Moved {moved}; couldn't move:\n{}", failed.join("\n")),
+                        true,
+                    );
                 }
             },
         );
@@ -877,12 +1215,12 @@ impl App {
     }
 
     fn run_update(&mut self) {
-        let Some(prefix) = update::brew_prefix() else {
+        let Some(tag) = self.update.clone() else {
             return;
         };
         self.updating = true;
         self.bg(
-            move || update::brew_upgrade(&prefix).and_then(|_| update::relaunch()),
+            move || update::update_self(&tag).and_then(|_| update::relaunch()),
             |s, res, tx| {
                 s.updating = false;
                 match res {
@@ -923,11 +1261,13 @@ fn setup(s: &mut App, waker: Waker) {
     {
         s.confirm = Some(Confirm::InstallApp);
     }
+    if let Backend::Remote(server) = &s.backend {
+        crate::tunnel::carry(Some(server.clone()));
+    }
     s.reload_bots();
     if let Some(slug) = s.bots.keys().next().cloned() {
         s.select(&slug);
     }
-    s.host_client();
 }
 
 fn poll(s: &mut App, now: f64, tx: &mut Tx) -> bool {
@@ -938,20 +1278,38 @@ fn poll(s: &mut App, now: f64, tx: &mut Tx) -> bool {
         changed = true;
     }
     let live = rune::tooling::headless_run().is_none();
-    let can_list = s.oc.is_some() || s.containers.values().any(|st| st == "running");
-    if can_list && s.models.is_empty() && !s.models_loading {
-        let oc = s.oc.clone();
-        s.load_models(oc);
+    if live && s.models.is_empty() && !s.models_loading && now >= s.next_models {
+        s.load_models();
+    }
+    if live && s.backend.is_remote() && now >= s.next_context_push {
+        s.next_context_push = now + CONTEXT_PUSH_SECS;
+        s.push_context();
+    }
+    if s.connect
+        .as_ref()
+        .is_some_and(|c| c.code.is_some() && !c.busy)
+        && now >= s.next_pair
+    {
+        s.try_connect();
     }
     if live && now >= s.next_doctor && !s.issues_inflight {
         s.next_doctor = now + DOCTOR_SECS;
         s.issues_inflight = true;
-        let bots = s.bots.clone();
+        let backend = s.backend.clone();
         s.bg(
-            move || container::doctor(&bots),
-            |s, issues, _| {
+            move || backend.call::<Vec<container::Issue>>(Request::Doctor),
+            |s, res, _| {
                 s.issues_inflight = false;
-                s.issues = issues;
+                s.issues = res.unwrap_or_else(|e| {
+                    vec![container::Issue {
+                        bot: None,
+                        problem: format!("Can't reach the dumBot server: {e:#}"),
+                        fix: "Check that it's running (`systemctl --user status dumbot` there) \
+                              and reachable, or choose Server… to run bots on this computer."
+                            .into(),
+                        warning: false,
+                    }]
+                });
             },
         );
     }
@@ -964,27 +1322,45 @@ fn poll(s: &mut App, now: f64, tx: &mut Tx) -> bool {
     if live && now >= s.next_scan {
         s.next_scan = now + SCAN_SECS;
         tx.wake_after(Duration::from_secs_f64(SCAN_SECS));
-        s.reload_bots();
+        if !s.backend.is_remote() {
+            s.reload_bots();
+        }
         changed = true;
         if !s.active_inflight {
             s.active_inflight = true;
+            let backend = s.backend.clone();
+            let asked = backend.clone();
             s.bg(
-                || {
-                    let states = container::states().unwrap_or_default();
-                    let mut active = HashSet::new();
-                    for (slug, _) in states.iter().filter(|(_, st)| *st == "running") {
-                        if let Ok(a) = container::client(slug).and_then(|c| c.active_sessions()) {
-                            active.extend(a);
-                        }
-                    }
-                    (states, active)
-                },
-                |s, (states, active), tx| {
+                move || backend.call::<api::Status>(Request::Status),
+                move |s, res, tx| {
                     s.active_inflight = false;
-                    s.containers = states;
-                    s.active = active;
-                    s.wake_due();
-                    s.pause_idle(tx.clock());
+                    if s.backend != asked {
+                        return;
+                    }
+                    let st = match res {
+                        Ok(st) => st,
+                        Err(e) => {
+                            s.server_error = Some(format!("{e:#}"));
+                            return;
+                        }
+                    };
+                    s.server_error = None;
+                    s.containers = st.states;
+                    s.active = st.active;
+                    if s.backend.is_remote() {
+                        // The server wakes its bots and pauses its containers itself.
+                        s.apply_bots(st.bots);
+                        s.server_starting = st.starting;
+                        s.default_model = st.default_model;
+                        if s.selected.is_none()
+                            && let Some(slug) = s.bots.keys().next().cloned()
+                        {
+                            s.select(&slug);
+                        }
+                    } else {
+                        s.wake_due();
+                        s.pause_idle(tx.clock());
+                    }
                 },
             );
         }
@@ -1019,10 +1395,9 @@ fn poll(s: &mut App, now: f64, tx: &mut Tx) -> bool {
     {
         s.chat_inflight = true;
         let id2 = id.clone();
-        let state = s.containers.get(&slug).cloned();
-        let host = s.oc.clone();
+        let backend = s.backend.clone();
         s.bg(
-            move || run_snapshot(&slug, state.as_deref(), host, &id2),
+            move || backend.call::<Snapshot>(Request::Snapshot { slug, session: id2 }),
             move |s, res, tx| {
                 s.chat_inflight = false;
                 let running = match res {
@@ -1047,31 +1422,6 @@ fn poll(s: &mut App, now: f64, tx: &mut Tx) -> bool {
         );
     }
     changed
-}
-
-/// A run's transcript: from the bot's container, or from the host's opencode service for runs
-/// from before bots ran in containers (or when the container is gone).
-fn run_snapshot(
-    slug: &str,
-    state: Option<&str>,
-    host: Option<Client>,
-    id: &str,
-) -> anyhow::Result<Snapshot> {
-    let from_container = match state {
-        None => Err(anyhow::anyhow!("the bot has no container yet")),
-        Some(st) => (|| {
-            if st == "paused" {
-                container::resume(slug)?;
-            }
-            container::client(slug)?.snapshot(id)
-        })(),
-    };
-    from_container.or_else(|e| {
-        let host = host.map_or_else(Client::connect, Ok);
-        host.and_then(|h| h.snapshot(id)).map_err(|_| {
-            anyhow::anyhow!("it's in neither the bot's container ({e:#}) nor your opencode service")
-        })
-    })
 }
 
 fn on_key(s: &mut App, ev: &KeyEvent, _tx: &mut Tx) -> bool {
@@ -1190,8 +1540,7 @@ fn toolbar_actions(s: &App, k: &Kit) -> El {
         r = r.child(Spinner::new().build(k));
     }
     if let Some(bot) = s.bot() {
-        let running =
-            s.is_running(bot) || s.selected.as_ref().is_some_and(|x| s.starting.contains(x));
+        let running = s.is_running(bot) || s.selected.as_ref().is_some_and(|x| s.is_starting(x));
         r = r
             .child(
                 small("Run now", ButtonVariant::Contrast)
@@ -1206,7 +1555,7 @@ fn toolbar_actions(s: &App, k: &Kit) -> El {
             )
             .child(
                 small("Environment…", ButtonVariant::Ghost)
-                    .on_press(|s: &mut App| s.env_edit = Some(EnvEdit::open(s.selected.clone())))
+                    .on_press(|s: &mut App| s.open_env(s.selected.clone()))
                     .build(k),
             )
             .child(
@@ -1215,8 +1564,13 @@ fn toolbar_actions(s: &App, k: &Kit) -> El {
                     .build(k),
             )
             .child(
-                small("Open folder", ButtonVariant::Ghost)
-                    .on_press(|s: &mut App| s.open_folder())
+                small("Upload files…", ButtonVariant::Ghost)
+                    .on_press_tx(|s: &mut App, tx| s.pick_upload(tx, false))
+                    .build(k),
+            )
+            .child(
+                small("Upload folder…", ButtonVariant::Ghost)
+                    .on_press_tx(|s: &mut App, tx| s.pick_upload(tx, true))
                     .build(k),
             );
     }
@@ -1250,6 +1604,8 @@ fn sidebar(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
                 Some((step, at)) => format!("{step}… {}", secs(s.clock - at)),
                 None => "Starting…".to_string(),
             }
+        } else if let Some(step) = s.server_starting.get(slug) {
+            format!("{step}…")
         } else if s.is_running(bot) {
             "Running…".to_string()
         } else {
@@ -1310,7 +1666,7 @@ fn sidebar(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     }
     let mut options = vec![ComboboxOption::new("", "opencode default")];
     options.extend(s.models.iter().cloned());
-    let current = known(&options, s.store.model.as_ref());
+    let current = known(&options, s.default_model.as_ref());
     let model = Combobox::new(
         "default-model",
         &s.default_combo,
@@ -1348,20 +1704,35 @@ fn sidebar(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
         .child(
             SidebarRow::new("Instructions for all bots")
                 .height(32.0)
-                .on_select(|s: &mut App, _| {
-                    let mut t = TextEdit::new(store::instructions());
-                    t.focused = true;
-                    s.instructions = Some(t);
-                })
+                .on_select(|s: &mut App, _| s.open_instructions())
                 .build(k)
                 .key("instructions"),
         )
         .child(
             SidebarRow::new("Environment variables")
                 .height(32.0)
-                .on_select(|s: &mut App, _| s.env_edit = Some(EnvEdit::open(None)))
+                .on_select(|s: &mut App, _| s.open_env(None))
                 .build(k)
                 .key("environment"),
+        )
+        .child(
+            SidebarRow::new("MCP servers for bots")
+                .height(32.0)
+                .on_select(|s: &mut App, _| s.open_mcp())
+                .build(k)
+                .key("bot-mcp"),
+        )
+        .child(
+            SidebarRow::new(match (&s.backend, &s.server_error) {
+                (Backend::Local, _) => "Bots run on this computer".to_string(),
+                (Backend::Remote(r), None) => format!("Bots run on {}", r.addr),
+                (Backend::Remote(r), Some(_)) => format!("Can't reach {}", r.addr),
+            })
+            .subtitle("Server…")
+            .height(44.0)
+            .on_select(|s: &mut App, _| s.open_connect())
+            .build(k)
+            .key("server"),
         );
     sb = sb.footer(footer);
     sb.build(k)
@@ -1393,8 +1764,7 @@ fn main_pane(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
         || {
             format!(
                 "default ({})",
-                s.store
-                    .model
+                s.default_model
                     .as_ref()
                     .map_or("opencode default".into(), |m| s.model_name(m))
             )
@@ -1404,7 +1774,10 @@ fn main_pane(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     head = head.child(
         text(format!(
             "{} · model: {model} · {} runs",
-            bots::dir(&slug).display(),
+            match &s.backend {
+                Backend::Local => bots::dir(&slug).display().to_string(),
+                Backend::Remote(r) => format!("on {}", r.addr),
+            },
             bot.runs.len()
         ))
         .font(k.ty.small)
@@ -1465,6 +1838,7 @@ fn main_pane(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
                 .padding(20.0)
                 .child(Markdown::new(body).selectable(true).build(k)),
         );
+    let drop_slug = slug.clone();
     let delete = small("Delete bot", ButtonVariant::GhostFaint)
         .on_press(move |s: &mut App| s.confirm = Some(Confirm::Delete(slug.clone())))
         .build(k);
@@ -1500,6 +1874,11 @@ fn main_pane(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
                     })
                     .build(k),
                 ),
+        )
+        .on_drop_files(
+            move |s: &mut App, paths: &[std::path::PathBuf], _: &mut Tx| {
+                s.upload(drop_slug.clone(), paths.to_vec())
+            },
         )
         .child(match s.tab {
             Tab::Files => row()
@@ -1862,23 +2241,17 @@ fn agent_panel(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
         .child(model);
     let mut actions = row().gap(6.0).items_center().child(row().grow(1.0));
     if id.is_some() {
-        actions = actions
-            .child(
-                small("Open in terminal", ButtonVariant::Ghost)
-                    .on_press(|s: &mut App| s.open_terminal())
-                    .build(k),
-            )
-            .child(
-                small("New run", ButtonVariant::Outline)
-                    .disabled(running)
-                    .on_press(|s: &mut App| s.run_now())
-                    .build(k),
-            );
+        actions = actions.child(
+            small("New run", ButtonVariant::Outline)
+                .disabled(running)
+                .on_press(|s: &mut App| s.run_now())
+                .build(k),
+        );
     }
     if running {
         actions = actions.child(
             small("Stop", ButtonVariant::Danger)
-                .on_press(|s: &mut App| s.session_call(|oc, id| oc.interrupt(id)))
+                .on_press(|s: &mut App| s.session_call(SessionAction::Interrupt))
                 .build(k),
         );
     }
@@ -2098,7 +2471,10 @@ fn permission(k: &Kit, p: &opencode::Permission) -> El {
         small(label, v)
             .on_press(move |s: &mut App| {
                 let id = id.clone();
-                s.session_call(move |oc, sid| oc.reply_permission(sid, &id, decision));
+                s.session_call(SessionAction::Permission {
+                    request: id.clone(),
+                    decision: decision.into(),
+                });
             })
             .build(k)
     };
@@ -2315,6 +2691,29 @@ fn sandbox_dialog(s: &App, e: &SandboxEdit, k: &Kit, layer: &mut Vec<El>) {
     }
     body.push(label(
         k,
+        "MCP servers only this bot gets (JSON, opencode's mcp format)",
+    ));
+    if !e.global_mcp.is_empty() {
+        body.push(
+            text(format!(
+                "It also gets every bot's: {}.",
+                e.global_mcp.join(", ")
+            ))
+            .font(k.ty.small)
+            .color(k.c.text_faint)
+            .wrap(),
+        );
+    }
+    body.push(
+        TextArea::new(&e.own_mcp)
+            .placeholder("{ \"notes\": { \"type\": \"remote\", \"url\": \"https://…/mcp\" } }")
+            .auto_grow(2, 10)
+            .width(None)
+            .on_edit(|s: &mut App| &mut s.sandbox_edit.as_mut().expect("dialog open").own_mcp)
+            .build(k),
+    );
+    body.push(label(
+        k,
         "More folders (read-write, same path; one per line)",
     ));
     body.push(
@@ -2416,6 +2815,109 @@ fn issues_dialog(s: &App, k: &Kit, layer: &mut Vec<El>) {
     );
 }
 
+fn connect_dialog(s: &App, c: &ConnectEdit, k: &Kit, layer: &mut Vec<El>) {
+    let mut body = vec![
+        label(k, "Server address"),
+        TextInput::new(&c.addr)
+            .placeholder("192.168.1.20 or myserver:7457")
+            .width(None)
+            .on_edit(|s: &mut App| &mut s.connect.as_mut().expect("dialog open").addr)
+            .on_submit(|s: &mut App, _| s.try_connect())
+            .build(k),
+    ];
+    if let Some(code) = &c.code {
+        let cmd = format!("dumbot server approve {code}");
+        body.push(
+            col()
+                .w_full()
+                .gap(6.0)
+                .padding(10.0)
+                .radius(8.0)
+                .fill(k.c.layer_01)
+                .child(
+                    text("The server doesn't know this app yet. To pair them, run this on the server:")
+                        .font(k.ty.ui)
+                        .color(k.c.text_base)
+                        .wrap(),
+                )
+                .child(
+                    row()
+                        .w_full()
+                        .gap(8.0)
+                        .items_center()
+                        .child(
+                            text(cmd.clone())
+                                .font(k.ty.mono)
+                                .color(k.c.text_base)
+                                .selectable(true)
+                                .grow(1.0),
+                        )
+                        .child(copy_button(k, cmd)),
+                )
+                .child(
+                    text(format!(
+                        "The code comes from both machines' keys, so it only matches if nothing is in between. Server key: {}…",
+                        c.pinned
+                            .as_ref()
+                            .and_then(|p| p.fingerprint.as_deref())
+                            .map_or("", |f| &f[..16])
+                    ))
+                    .font(k.ty.small)
+                    .color(k.c.text_faint)
+                    .wrap(),
+                )
+                .child(
+                    row()
+                        .gap(8.0)
+                        .items_center()
+                        .child(Spinner::new().build(k))
+                        .child(
+                            text("Waiting for approval…")
+                                .font(k.ty.small)
+                                .color(k.c.text_faint),
+                        ),
+                ),
+        );
+    }
+    if let Some(e) = &c.error {
+        body.push(
+            text(e.clone())
+                .font(k.ty.small)
+                .color(k.c.danger.fg)
+                .wrap()
+                .selectable(true),
+        );
+    }
+    let mut actions = Vec::new();
+    if s.backend.is_remote() {
+        actions.push(
+            Button::new("Run bots on this computer")
+                .variant(ButtonVariant::Ghost)
+                .on_press(|s: &mut App| s.disconnect())
+                .build(k),
+        );
+    }
+    actions.push(cancel(k));
+    actions.push(
+        Button::new(if c.busy { "Connecting…" } else { "Connect" })
+            .variant(ButtonVariant::Contrast)
+            .disabled(c.busy || c.code.is_some())
+            .on_press(|s: &mut App| s.try_connect())
+            .build(k),
+    );
+    modal(
+        "server",
+        "Where bots run",
+        Some(
+            "Bots run on this computer, or on a dumBot server (`dumbot install-server` on that machine). Connected to a server, this app manages its bots, and the server runs them on schedule while the app is closed, with your opencode config and logins.",
+        ),
+        body,
+        actions,
+        k,
+        layer,
+    );
+}
+
 static EMPTY_VARS: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
 
 fn close_dialogs(s: &mut App) {
@@ -2425,6 +2927,8 @@ fn close_dialogs(s: &mut App) {
     s.env_edit = None;
     s.show_issues = false;
     s.sandbox_edit = None;
+    s.connect = None;
+    s.mcp_edit = None;
 }
 
 fn modal(
@@ -2505,6 +3009,32 @@ fn dialogs(s: &App, k: &Kit, layer: &mut Vec<El>) {
     if s.show_issues {
         issues_dialog(s, k, layer);
     }
+    if let Some(c) = &s.connect {
+        connect_dialog(s, c, k, layer);
+    }
+    if let Some(e) = &s.mcp_edit {
+        let area = TextArea::new(&e.text)
+            .placeholder("{\n  \"gotify\": { \"type\": \"remote\", \"url\": \"https://…/mcp\", \"headers\": { \"Authorization\": \"Bearer …\" } },\n  \"tool\": { \"type\": \"local\", \"command\": [\"npx\", \"-y\", \"some-mcp\"] }\n}")
+            .auto_grow(10, 24)
+            .width(None)
+            .on_edit(|s: &mut App| &mut s.mcp_edit.as_mut().expect("dialog open").text)
+            .build(k);
+        let save = Button::new("Save")
+            .variant(ButtonVariant::Contrast)
+            .on_press(|s: &mut App| s.save_mcp())
+            .build(k);
+        modal(
+            "bot-mcp",
+            "MCP servers for bots",
+            Some(
+                "Every bot gets these, as well as the MCP servers from your opencode config it's turned on (Container…), and its own. A JSON object of servers by name, in opencode's mcp format. Local servers run inside the bot's container.",
+            ),
+            vec![area],
+            vec![cancel(k), save],
+            k,
+            layer,
+        );
+    }
     if let Some((name, purpose)) = &s.new_bot {
         let name = TextInput::new(name)
             .placeholder("Inbox triager")
@@ -2534,6 +3064,38 @@ fn dialogs(s: &App, k: &Kit, layer: &mut Vec<El>) {
         );
     }
     match &s.confirm {
+        Some(Confirm::MoveBots(slugs)) => {
+            let names: Vec<String> = slugs.clone();
+            let ok = Button::new(if s.moving {
+                "Moving…"
+            } else {
+                "Move to the server"
+            })
+            .variant(ButtonVariant::Contrast)
+            .disabled(s.moving)
+            .on_press(move |s: &mut App| s.move_bots(names.clone()))
+            .build(k);
+            let keep = Button::new("Keep them here")
+                .variant(ButtonVariant::Ghost)
+                .on_press(close_dialogs)
+                .build(k);
+            modal(
+                "move-bots",
+                &format!(
+                    "Move {} bot{} to the server?",
+                    slugs.len(),
+                    if slugs.len() == 1 { "" } else { "s" }
+                ),
+                Some(&format!(
+                    "This computer has {}. Each one's folder (AGENTS.md, memory, scripts, skills), schedule, settings and own environment variables are copied to the server, then removed here. Run history stays behind. Bots left here don't run while the app is connected to a server.",
+                    slugs.join(", ")
+                )),
+                vec![],
+                vec![keep, ok],
+                k,
+                layer,
+            );
+        }
         Some(Confirm::Delete(slug)) => {
             let slug = slug.clone();
             let name = s.bots.get(&slug).map_or(slug.clone(), |b| b.name.clone());
@@ -2578,19 +3140,11 @@ fn dialogs(s: &App, k: &Kit, layer: &mut Vec<El>) {
         }
         Some(Confirm::Update) => {
             let Some(tag) = s.update.clone() else { return };
-            let brew = update::brew_prefix().is_some();
             let notes = format!("https://github.com/{}/releases/tag/{tag}", update::REPO);
-            let desc = if brew {
-                format!(
-                    "dumBot {tag} is available (you have v{}).",
-                    update::current()
-                )
-            } else {
-                format!(
-                    "dumBot {tag} is available (you have v{}). This copy wasn't installed with Homebrew; download it from the release page.",
-                    update::current()
-                )
-            };
+            let desc = format!(
+                "dumBot {tag} is available (you have v{}).",
+                update::current()
+            );
             let skip_tag = tag.clone();
             let mut actions = vec![
                 Button::new("Skip this version")
@@ -2616,7 +3170,7 @@ fn dialogs(s: &App, k: &Kit, layer: &mut Vec<El>) {
                     })
                     .build(k),
             ];
-            if brew {
+            {
                 actions.push(
                     Button::new(if s.updating {
                         "Updating…"
@@ -2768,12 +3322,13 @@ pub fn main() {
                             Some("runs `railway` inside the container, which has only the image's programs, not your computer's".into()),
                         ),
                     ],
+                    own_mcp: TextEdit::new("{\n  \"notes\": { \"type\": \"remote\", \"url\": \"https://notes.example/mcp\" }\n}"),
+                    global_mcp: vec!["gotify".into()],
                 });
             }),
             ("environment", |s: &mut App| {
                 demo(s);
-                let mut e = EnvEdit::open(Some("inbox-triager".into()));
-                e.env = env::Env::default();
+                let mut e = EnvEdit::open(Some("inbox-triager".into()), env::Env::default());
                 e.env.global.insert("API_TOKEN".into(), "x".into());
                 e.env.global.insert("SERVICE_URL".into(), "x".into());
                 e.env
@@ -2784,6 +3339,41 @@ pub fn main() {
                     .insert("SERVICE_URL".into(), "y".into());
                 e.value = TextEdit::new("x".repeat(400));
                 s.env_edit = Some(e);
+            }),
+            ("server", |s: &mut App| {
+                demo(s);
+                s.connect = Some(ConnectEdit {
+                    addr: TextEdit::new("192.168.86.36"),
+                    pinned: Some(Server {
+                        addr: "192.168.86.36:7457".into(),
+                        fingerprint: Some(
+                            "415049c3b42b285f90c47104df3f812c5c81365ac588ff090c6b840e3a3ef8db"
+                                .into(),
+                        ),
+                    }),
+                    code: Some("JM9X-4G3W".into()),
+                    busy: false,
+                    error: None,
+                });
+            }),
+            ("move-bots", |s: &mut App| {
+                demo(s);
+                s.backend = Backend::Remote(Server {
+                    addr: "192.168.86.36:7457".into(),
+                    fingerprint: None,
+                });
+                s.confirm = Some(Confirm::MoveBots(vec![
+                    "inbox-triager".into(),
+                    "fantasy-football".into(),
+                ]));
+            }),
+            ("bot-mcp", |s: &mut App| {
+                demo(s);
+                s.mcp_edit = Some(McpEdit {
+                    text: TextEdit::new(
+                        "{\n  \"gotify\": {\n    \"type\": \"remote\",\n    \"url\": \"https://gotify.example/mcp\"\n  }\n}",
+                    ),
+                });
             }),
             ("instructions", |s: &mut App| {
                 demo(s);
@@ -2829,6 +3419,7 @@ pub fn main() {
 #[cfg(test)]
 mod live_tests {
     use super::*;
+    use crate::opencode::Client;
 
     /// Hits the local opencode service: `cargo test -- --ignored`. Creates a bot in a temp
     /// data dir and opens a session in its folder, as a run does, without prompting a model.

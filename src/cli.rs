@@ -1,7 +1,7 @@
 //! Commands bots (and people) run: `dumbot wake <bot> <when> [--note TEXT]` and
 //! `dumbot list`. They change `bot.json` directly; the running app notices within seconds.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 
 use crate::{bots, container, schedule, store};
 
@@ -12,13 +12,22 @@ pub fn run(args: &[String]) -> bool {
         Some("list") => list(),
         Some("run") => run_bot(&args[2..]),
         Some("doctor") => doctor(),
+        Some("server") => crate::server::cli(&args[2..]),
+        Some("mcp") => crate::mcp::cli(&args[2..]),
+        Some("install-server") => crate::server::install(&args[2..]),
+        Some("uninstall-server") => crate::server::uninstall(),
+        Some("connect") => connect(&args[2..]),
+        Some("disconnect") => disconnect(),
         // The shell wrapper bots' commands run through (see `env`).
         Some("shell") => match crate::env::run_shell(&args[2..]) {
             Ok(code) => std::process::exit(code),
             Err(e) => Err(e),
         },
         Some("help" | "--help" | "-h") => {
-            println!("{USAGE}");
+            println!(
+                "{USAGE}\n\nRunning bots on another machine:\n{}",
+                crate::server::USAGE
+            );
             Ok(())
         }
         _ => return false,
@@ -40,6 +49,9 @@ const USAGE: &str = "dumBot: bots that rewrite themselves, run through opencode.
         <when>: now | in 30m | in 1h30m | at 09:00 | at 2026-12-01 09:00 | every 6h
                 | on wed,thu at 19:00 | on weekends at 10:00,18:00 | off
         Weekly rules add up; in/at add a one-off wake-up; off clears everything.
+  dumbot mcp <bot> add|remove|list   MCP servers a bot installs for itself (`dumbot mcp x` for help)
+  dumbot connect <host[:port]>   manage the bots on a dumBot server (pairs on first use)
+  dumbot disconnect              manage this computer's bots again
   dumbot install-app             add dumbot.app to ~/Applications (macOS)
   dumbot uninstall-app";
 
@@ -121,5 +133,58 @@ fn list() -> Result<()> {
             println!("    {line}");
         }
     }
+    Ok(())
+}
+
+/// Pairs with a server (waiting for `dumbot server approve` there) and makes the app use it.
+fn connect(args: &[String]) -> Result<()> {
+    let addr = crate::remote::normalize_addr(
+        args.first()
+            .ok_or_else(|| anyhow!("usage: dumbot connect <host[:port]>"))?,
+    );
+    let mut server = crate::remote::Server {
+        addr: addr.clone(),
+        fingerprint: None,
+    };
+    let mut shown = false;
+    loop {
+        let (pinned, code) = server.pair()?;
+        server = pinned;
+        let Some(code) = code else { break };
+        if !shown {
+            shown = true;
+            println!(
+                "On {}, run:\n\n    dumbot server approve {code}\n\nServer fingerprint: {}\nWaiting…",
+                addr.rsplit_once(':').map_or(addr.as_str(), |x| x.0),
+                server.fingerprint.as_deref().unwrap_or_default()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    let backend = crate::api::Backend::Remote(server.clone());
+    backend
+        .call::<()>(crate::api::Request::SyncContext {
+            context: crate::context::gather(),
+        })
+        .context("send your opencode config to the server")?;
+    let mut st = store::Store::load();
+    st.remote = Some(server);
+    st.save()?;
+    println!("Connected to {addr}. The app manages the bots there now.");
+    let local = bots::list();
+    if !local.is_empty() {
+        println!(
+            "This computer has {} bot(s); the app offers to move them to the server.",
+            local.len()
+        );
+    }
+    Ok(())
+}
+
+fn disconnect() -> Result<()> {
+    let mut st = store::Store::load();
+    st.remote = None;
+    st.save()?;
+    println!("The app manages this computer's bots again.");
     Ok(())
 }

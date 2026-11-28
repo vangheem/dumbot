@@ -8,7 +8,7 @@ use crate::bots::{Bot, Rule};
 
 const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Schedule {
     /// Once, at this Unix time.
     At(i64),
@@ -225,7 +225,7 @@ pub fn fired(bot: &mut Bot, now: i64) -> Vec<String> {
 }
 
 /// One of a bot's wake-ups, as listed in the app.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Item {
     Once,
     Every,

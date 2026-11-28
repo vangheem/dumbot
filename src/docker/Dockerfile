@@ -52,6 +52,18 @@ RUN if [ -n "$BROWSE_VERSION" ]; then \
         && rm -rf /tmp/browse; \
     fi
 
+ARG TARGETARCH
+# Node.js (npx) and uv (uvx), which most MCP servers run with; bots install more in their home.
+ARG NODE_MAJOR=22
+RUN case "$TARGETARCH" in arm64) arch=arm64 ;; *) arch=x64 ;; esac \
+    && v=$(curl -fsSL https://nodejs.org/dist/index.json \
+        | jq -r "[.[] | select(.version | startswith(\"v$NODE_MAJOR.\"))][0].version") \
+    && curl -fsSL "https://nodejs.org/dist/$v/node-$v-linux-$arch.tar.xz" \
+        | tar -xJ -C /usr/local --strip-components=1 --exclude CHANGELOG.md --exclude README.md --exclude LICENSE \
+    && curl -fsSL https://astral.sh/uv/install.sh \
+        | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh \
+    && node --version && uv --version
+
 ARG OPENCODE_VERSION
 ARG TARGETARCH
 RUN case "$TARGETARCH" in arm64) arch=arm64 ;; *) arch=x64 ;; esac \

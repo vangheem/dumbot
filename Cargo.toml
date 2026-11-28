@@ -1,6 +1,6 @@
 [package]
 name = "dumbot"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Self-rewriting markdown bots that run on a schedule through opencode"
 license = "MIT"
@@ -10,9 +10,12 @@ repository = "https://github.com/vangheem/dumbot"
 anyhow = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-rune = { optional = true, git = "https://github.com/anomalyco/rune", rev = "e98ea23b788069dcf5327d71a4507ce1a9404bbe" }
+rcgen = "0.13"
+ring = "0.17"
+rune = { optional = true, git = "https://github.com/anomalyco/rune", rev = "e98ea23b788069dcf5327d71a4507ce1a9404bbe", features = ["native-file-dialog"] }
 rune-kit = { optional = true, git = "https://github.com/anomalyco/rune", rev = "e98ea23b788069dcf5327d71a4507ce1a9404bbe", features = ["markdown"] }
 rune-theme-opencode = { optional = true, git = "https://github.com/anomalyco/rune", rev = "e98ea23b788069dcf5327d71a4507ce1a9404bbe" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }

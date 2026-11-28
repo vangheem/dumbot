@@ -17,6 +17,9 @@ pub struct Store {
     /// A release the user chose to skip ("v0.4.0").
     #[serde(default)]
     pub skipped_version: Option<String>,
+    /// The dumBot server this app manages bots on; bots run on this computer when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<crate::remote::Server>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,7 +43,11 @@ impl ModelRef {
     }
 }
 
+/// `~/.local/share/dumbot`, or `$DUMBOT_DATA_DIR` (to run a second instance, or tests).
 pub fn data_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("DUMBOT_DATA_DIR") {
+        return PathBuf::from(d);
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));

@@ -228,6 +228,10 @@ pub fn delete(slug: &str) -> Result<()> {
     if env.bots.remove(slug).is_some() {
         env.save()?;
     }
+    let mut mcp = crate::mcp::load();
+    if mcp.bots.remove(slug).is_some() {
+        mcp.save()?;
+    }
     crate::container::remove(slug);
     let d = dir(slug);
     std::fs::remove_dir_all(&d).with_context(|| format!("remove {}", d.display()))
@@ -241,7 +245,39 @@ pub fn files(slug: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     collect(&root, &root, &mut out);
     out.sort_by(|a, b| (a.0 != "AGENTS.md", &a.0).cmp(&(b.0 != "AGENTS.md", &b.0)));
+    if let Some(list) = uploads(&root) {
+        out.push((format!("{UPLOADS}/ (uploaded)"), list));
+    }
     out
+}
+
+/// The files the user uploaded, as a markdown list with sizes.
+fn uploads(root: &Path) -> Option<String> {
+    fn walk(root: &Path, at: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(at) else {
+            return;
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let p = e.path();
+            if p.is_dir() {
+                walk(root, &p, out);
+            } else if let (Ok(rel), Ok(m)) = (p.strip_prefix(root), e.metadata()) {
+                let kb = m.len().div_ceil(1024);
+                out.push(format!("- `{}` ({kb} KB)", rel.display()));
+            }
+        }
+    }
+    let dir = root.join(UPLOADS);
+    let mut lines = Vec::new();
+    walk(&dir, &dir, &mut lines);
+    (!lines.is_empty()).then(|| {
+        format!(
+            "# Uploaded files\n\nIn `{UPLOADS}/`, for the bot to use and refer to:\n\n{}",
+            lines.join("\n")
+        )
+    })
 }
 
 fn collect(root: &Path, at: &Path, out: &mut Vec<(String, String)>) {
@@ -252,7 +288,8 @@ fn collect(root: &Path, at: &Path, out: &mut Vec<(String, String)>) {
         let path = e.path();
         let name = e.file_name().to_string_lossy().into_owned();
         if path.is_dir() {
-            if name != ".git" {
+            // Uploads are listed together (see `uploads`), not rendered one by one.
+            if name != ".git" && path != root.join(UPLOADS) {
                 collect(root, &path, out);
             }
         } else if path.extension().is_some_and(|x| x == "md")
@@ -264,7 +301,7 @@ fn collect(root: &Path, at: &Path, out: &mut Vec<(String, String)>) {
                 out.push((rel, body));
             }
         } else if let Ok(rel) = path.strip_prefix(root)
-            && rel.starts_with("scripts")
+            && (rel.starts_with("scripts") || rel == Path::new("mcp.json"))
             && let Ok(body) = std::fs::read_to_string(&path)
         {
             // Scripts show as code.
@@ -273,6 +310,9 @@ fn collect(root: &Path, at: &Path, out: &mut Vec<(String, String)>) {
         }
     }
 }
+
+/// Where files the user uploads for the bot go, in its folder.
+pub const UPLOADS: &str = "files";
 
 /// The opencode agent every run uses, written into each bot's folder.
 pub const AGENT: &str = "dumbot";
@@ -331,6 +371,10 @@ pub fn prepare(slug: &str, bot: &Bot) -> Result<()> {
             .replace("{data}", &store::data_dir().display().to_string())
             .replace("{exe}", "dumbot")
             .replace("{slug}", slug)
+            .replace(
+                "{home}",
+                &std::env::var("HOME").unwrap_or_else(|_| "~".into()),
+            )
             .replace("{env_section}", &env)
             .replace("{user_section}", &user);
         std::fs::write(path, body)?;
@@ -343,7 +387,7 @@ pub fn prepare(slug: &str, bot: &Bot) -> Result<()> {
         serde_json::to_vec_pretty(&serde_json::json!({
             "$schema": "https://opencode.ai/config.json",
             "shell": "/usr/local/bin/dumbot-shell",
-            "mcp": crate::container::mcp_config(bot),
+            "mcp": crate::container::mcp_config(slug, bot),
         }))?,
     )?;
     Ok(())

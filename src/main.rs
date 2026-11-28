@@ -6,16 +6,22 @@
 //! bots' containers (`dumbot wake`, `dumbot shell`).
 #![cfg_attr(not(feature = "gui"), allow(dead_code))]
 
+mod api;
 #[cfg(feature = "gui")]
 mod app;
 mod appbundle;
 mod bots;
 mod cli;
 mod container;
+mod context;
 mod env;
+mod mcp;
 mod opencode;
+mod remote;
 mod schedule;
+mod server;
 mod store;
+mod tunnel;
 mod update;
 
 fn main() {

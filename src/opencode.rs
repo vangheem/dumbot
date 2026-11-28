@@ -19,7 +19,7 @@ pub struct Client {
 }
 
 /// One rendered entry of a session transcript.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Entry {
     User(String),
     Text(String),
@@ -36,7 +36,7 @@ pub enum Entry {
     Error(String),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Permission {
     pub id: String,
     pub action: String,
@@ -44,7 +44,7 @@ pub struct Permission {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Snapshot {
     pub entries: Vec<Entry>,
     pub running: bool,
@@ -53,7 +53,7 @@ pub struct Snapshot {
 }
 
 /// A session's model and what it has used so far.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Usage {
     pub model: Option<ModelRef>,
     pub input: u64,
@@ -137,10 +137,6 @@ impl Client {
             auth,
             agent,
         }
-    }
-
-    pub fn url(&self) -> &str {
-        &self.url
     }
 
     /// Whether the server answers.

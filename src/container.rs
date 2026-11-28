@@ -61,7 +61,7 @@ pub const TOOLS: &[Tool] = &[
 ];
 
 /// Something wrong with running bots, and what to do about it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Issue {
     /// `None` for everything.
     pub bot: Option<String>,
@@ -121,14 +121,23 @@ fn state_dir(slug: &str) -> PathBuf {
     store::data_dir().join("containers").join(slug)
 }
 
-fn opencode_config_dir() -> PathBuf {
+pub fn opencode_config_dir() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".config"))
         .join("opencode")
 }
 
-fn command_output(cmd: &str, args: &[&str]) -> Option<String> {
+/// The opencode config bots' containers get: on a server, the app's (see `context`).
+fn opencode_config_src() -> PathBuf {
+    if crate::context::current().is_some() {
+        crate::context::config_dir()
+    } else {
+        opencode_config_dir()
+    }
+}
+
+pub fn command_output(cmd: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(cmd)
         .args(args)
         .stdin(Stdio::null())
@@ -140,7 +149,7 @@ fn command_output(cmd: &str, args: &[&str]) -> Option<String> {
 }
 
 /// `2.2.7` from `opencode v2.2.7`.
-fn version_of(cmd: &str, args: &[&str]) -> Option<String> {
+pub fn version_of(cmd: &str, args: &[&str]) -> Option<String> {
     let v = command_output(cmd, args)?;
     let v = v.split_whitespace().last()?.trim_start_matches('v');
     Some(v.to_string())
@@ -219,13 +228,18 @@ fn image_spec() -> ImageSpec {
         ),
         (
             "OPENCODE_VERSION".into(),
-            version_of("opencode", &["--version"]).unwrap_or_default(),
+            crate::context::current()
+                .and_then(|c| c.opencode_version)
+                .or_else(|| version_of("opencode", &["--version"]))
+                .unwrap_or_default(),
         ),
         (
             "BROWSE_VERSION".into(),
-            browse_bin()
-                .and_then(|b| version_of(&b, &["version"]))
-                .unwrap_or_default(),
+            match crate::context::current() {
+                Some(c) => c.browse_version,
+                None => browse_version(),
+            }
+            .unwrap_or_default(),
         ),
     ];
     let mut parts: Vec<&str> = vec![DOCKERFILE, &fingerprint];
@@ -337,6 +351,14 @@ pub fn ensure_image(step: Step) -> Result<String> {
 
 // ---- host tools ---------------------------------------------------------------------------
 
+pub fn browse_version() -> Option<String> {
+    browse_bin().and_then(|b| version_of(&b, &["version"]))
+}
+
+pub fn browse_token_file() -> PathBuf {
+    home().join(".local/share/browse/relay-token")
+}
+
 fn browse_bin() -> Option<String> {
     let local = home().join(".local/bin/browse");
     if local.exists() {
@@ -345,8 +367,22 @@ fn browse_bin() -> Option<String> {
     command_output("sh", &["-c", "command -v browse"])
 }
 
-/// The host's browse relay port, starting the relay when it isn't running.
-fn browse_port() -> Result<u16> {
+/// The host's browse relay port, starting the relay when it isn't running. On a server, the
+/// port the app carries to its relay (see `tunnel`).
+pub fn browse_port() -> Result<u16> {
+    if let Some(c) = crate::context::current() {
+        if c.browse_token.is_none() {
+            return Err(anyhow!("browse isn't set up on the app's computer"));
+        }
+        if !crate::tunnel::connected() {
+            return Err(anyhow!(
+                "bots on a server use the browser on the app's computer, and the app isn't \
+                 connected now; they can use browse while it's open"
+            ));
+        }
+        return crate::tunnel::port()
+            .ok_or_else(|| anyhow!("browse isn't set up on the app's computer"));
+    }
     let bin = browse_bin().ok_or_else(|| anyhow!("browse isn't installed on this computer"))?;
     let port = || -> Option<u16> {
         let v: Value = serde_json::from_str(&command_output(&bin, &["status", "--json"])?).ok()?;
@@ -380,12 +416,17 @@ fn browse_port() -> Result<u16> {
 }
 
 fn gh_token() -> Result<String> {
+    if let Some(c) = crate::context::current() {
+        return c.gh_token.ok_or_else(|| {
+            anyhow!("`gh auth token` failed on the app's computer; run `gh auth login` there")
+        });
+    }
     command_output("gh", &["auth", "token"])
         .ok_or_else(|| anyhow!("`gh auth token` failed on this computer; run `gh auth login`"))
 }
 
 /// The host's time zone (`America/Chicago`), so bots' local times match yours.
-fn time_zone() -> Option<String> {
+pub fn time_zone() -> Option<String> {
     if let Ok(tz) = std::env::var("TZ")
         && !tz.is_empty()
     {
@@ -441,7 +482,7 @@ fn strip_jsonc(s: &str) -> String {
 /// The MCP servers in the host's opencode config, by name: under `mcp.servers`, and the
 /// older form, directly under `mcp`.
 pub fn host_mcp() -> BTreeMap<String, Value> {
-    let dir = opencode_config_dir();
+    let dir = opencode_config_src();
     let mut out = BTreeMap::new();
     for f in ["opencode.jsonc", "opencode.json", "config.json"] {
         let Ok(raw) = std::fs::read_to_string(dir.join(f)) else {
@@ -463,20 +504,26 @@ pub fn host_mcp() -> BTreeMap<String, Value> {
 }
 
 /// Why an MCP server may not work in a container, if it may not: one that runs a command
-/// runs it inside the container, where only the image's tools exist.
+/// runs it inside the container, which has node (npx) and uv (uvx) and whatever the bot
+/// installed, but not your computer's other programs.
 pub fn mcp_caveat(server: &Value) -> Option<String> {
     let cmd = server["command"].as_array()?.first()?.as_str()?;
+    if matches!(cmd, "npx" | "uvx" | "node" | "python3" | "uv" | "npm") {
+        return None;
+    }
     Some(format!(
-        "runs `{cmd}` inside the container, which has only the image's programs, not your computer's"
+        "runs `{cmd}` inside the container, which has node, uv and Python but not your computer's other programs"
     ))
 }
 
-/// The `mcp` section of a bot's opencode config: the host's servers the bot didn't opt in to
-/// are turned off, and browse runs from the image.
-pub fn mcp_config(bot: &Bot) -> Value {
+/// The `mcp` section of a bot's opencode config: the host's servers it opted in to, the
+/// bot-only ones (global and its own, see `mcp`), and browse from the image if it opted in.
+/// The host's other servers are turned off.
+pub fn mcp_config(slug: &str, bot: &Bot) -> Value {
     let mut servers = serde_json::Map::new();
     for (name, v) in host_mcp() {
         if bot.sandbox.mcp.contains(&name) {
+            servers.insert(name, v);
             continue;
         }
         // An entry must say what it is, even to turn it off.
@@ -488,9 +535,22 @@ pub fn mcp_config(bot: &Bot) -> Value {
         }
         servers.insert(name, off);
     }
+    // The bot's own installs, then the user's bot-only servers, which win.
+    let vars = crate::env::load().for_bot(slug);
+    for (name, mut v) in crate::mcp::installed(slug)
+        .into_iter()
+        .chain(crate::mcp::load().for_bot(slug))
+    {
+        crate::mcp::resolve_env(&mut v, &vars);
+        servers.insert(name, v);
+    }
     if bot.sandbox.has_tool("browse") {
         let mut env = json!({ "OPENCODE_BROWSER_AUTO_UPDATE": "off" });
-        if let Ok(p) = browse_port() {
+        let port = match crate::context::current() {
+            Some(_) => crate::tunnel::port(),
+            None => browse_port().ok(),
+        };
+        if let Some(p) = port {
             env["OPENCODE_BROWSER_PORT"] = json!(p.to_string());
         }
         servers.insert(
@@ -518,6 +578,11 @@ pub fn states() -> Result<HashMap<String, String>> {
         .filter_map(|l| l.split_once('\t'))
         .map(|(a, b)| (a.to_string(), b.to_string()))
         .collect())
+}
+
+/// One bot's container state, if it has a container.
+pub fn state(slug: &str) -> Option<String> {
+    docker(&["inspect", "--format", "{{.State.Status}}", &name(slug)]).ok()
 }
 
 fn password(slug: &str) -> Result<String> {
@@ -583,8 +648,14 @@ fn write_runtime_files(slug: &str, bot: &Bot) -> Result<Vec<Issue>> {
         &serde_json::to_vec_pretty(&env)?,
     )?;
     let mut git = String::from("# Written by dumBot for this bot's container.\n[user]\n");
+    let ctx = crate::context::current();
     for key in ["name", "email"] {
-        if let Some(v) = command_output("git", &["config", "--global", &format!("user.{key}")]) {
+        let v = match &ctx {
+            Some(c) if key == "name" => c.git_name.clone(),
+            Some(c) => c.git_email.clone(),
+            None => command_output("git", &["config", "--global", &format!("user.{key}")]),
+        };
+        if let Some(v) = v {
             git.push_str(&format!("\t{key} = {v}\n"));
         }
     }
@@ -610,7 +681,7 @@ fn container_spec(slug: &str, bot: &Bot, image: &str) -> Result<Spec> {
     let meta = std::fs::metadata(&home)?;
     let mut mounts: Vec<(PathBuf, PathBuf, bool)> = vec![
         (st.join("home"), home.clone(), false),
-        (opencode_config_dir(), opencode_config_dir(), false),
+        (opencode_config_src(), opencode_config_dir(), false),
         (bots::dir(slug), bots::dir(slug), false),
         (
             st.join("env.json"),
@@ -618,7 +689,7 @@ fn container_spec(slug: &str, bot: &Bot, image: &str) -> Result<Spec> {
             true,
         ),
     ];
-    std::fs::create_dir_all(opencode_config_dir())?;
+    std::fs::create_dir_all(opencode_config_src())?;
     let mut env: Vec<(String, String)> = vec![
         ("HOME".into(), home.display().to_string()),
         (
@@ -627,6 +698,27 @@ fn container_spec(slug: &str, bot: &Bot, image: &str) -> Result<Spec> {
         ),
         ("DUMBOT_BOT".into(), slug.into()),
         ("SHELL".into(), "/bin/bash".into()),
+        // What the bot installs (npm -g, pip --user, uv tool) lands in its home, which
+        // outlives the container.
+        (
+            "PATH".into(),
+            format!(
+                "{0}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                home.display()
+            ),
+        ),
+        (
+            "NPM_CONFIG_PREFIX".into(),
+            format!("{}/.local", home.display()),
+        ),
+        // The bot's opencode config: a change (an MCP server installed) restarts opencode.
+        (
+            "DUMBOT_CONFIG".into(),
+            short_hash(&[&std::fs::read_to_string(
+                bots::dir(slug).join(".opencode/opencode.json"),
+            )
+            .unwrap_or_default()]),
+        ),
         ("TERM".into(), "xterm-256color".into()),
     ];
     for v in ["XDG_CONFIG_HOME", "XDG_DATA_HOME"] {
@@ -634,16 +726,29 @@ fn container_spec(slug: &str, bot: &Bot, image: &str) -> Result<Spec> {
             env.push((v.into(), x));
         }
     }
-    if let Some(tz) = time_zone() {
+    if let Some(tz) = crate::context::current()
+        .and_then(|c| c.time_zone)
+        .or_else(time_zone)
+    {
         env.push(("TZ".into(), tz));
     }
     if bot.sandbox.has_tool("browse") {
-        let token = home.join(".local/share/browse/relay-token");
-        if token.exists() {
-            mounts.push((token.clone(), token, true));
+        let token = browse_token_file();
+        let src = match crate::context::current() {
+            Some(_) => crate::context::relay_token(),
+            None => token.clone(),
+        };
+        if src.exists() {
+            mounts.push((src, token, true));
         }
+        // On a server the port is fixed, so it's in the spec whether or not the app is
+        // connected right now.
+        let port = match crate::context::current() {
+            Some(_) => crate::tunnel::port(),
+            None => browse_port().ok(),
+        };
         if !host_network()
-            && let Ok(p) = browse_port()
+            && let Some(p) = port
         {
             env.push(("DUMBOT_BROWSE_FORWARD".into(), p.to_string()));
         }
@@ -654,6 +759,24 @@ fn container_spec(slug: &str, bot: &Bot, image: &str) -> Result<Spec> {
             None => PathBuf::from(m),
         };
         mounts.push((p.clone(), p, false));
+    }
+    // Docker makes the folders for mounts inside the home mount itself, as root, so the
+    // container couldn't write to them (`~/.local/share`); made here first, they're ours.
+    for (src, dst, _) in &mounts {
+        if let Ok(rel) = dst.strip_prefix(&home)
+            && !rel.as_os_str().is_empty()
+        {
+            let at = st.join("home").join(rel);
+            let dir = if src.is_dir() {
+                at.as_path()
+            } else {
+                at.parent().unwrap()
+            };
+            std::fs::create_dir_all(dir)?;
+            if !src.is_dir() && !at.exists() {
+                std::fs::write(&at, "")?;
+            }
+        }
     }
     let name = name(slug);
     let mut args: Vec<String> = vec![
@@ -850,9 +973,12 @@ fn ensure_inner(slug: &str, bot: &Bot, step: Step) -> Result<Client> {
 /// of the MCP servers the bot opted in to. They live in opencode's database, which can't be
 /// shared with a container safely. A login the container refreshed is replaced by the host's.
 fn sync_credentials(c: &Client, bot: &Bot) -> Result<()> {
-    let host = Client::connect()
-        .context("reach the opencode service on this computer, for your logins")?
-        .credentials()?;
+    let host = match crate::context::current() {
+        Some(c) => c.credentials,
+        None => Client::connect()
+            .context("reach the opencode service on this computer, for your logins")?
+            .credentials()?,
+    };
     let theirs: HashMap<String, Value> = c
         .credentials()?
         .into_iter()
@@ -908,16 +1034,6 @@ pub fn remove(slug: &str) {
     let _ = docker(&["rm", "-f", &name(slug)]);
     forget_client(slug);
     let _ = std::fs::remove_dir_all(state_dir(slug));
-}
-
-/// The command that opens a run in the opencode TUI, attached to the bot's container.
-pub fn attach_command(slug: &str, session: &str) -> Result<String> {
-    let c = client(slug)?;
-    Ok(format!(
-        "OPENCODE_SERVER_PASSWORD='{}' opencode --server {} -s {session}",
-        password(slug)?,
-        c.url()
-    ))
 }
 
 // ---- issues -------------------------------------------------------------------------------
