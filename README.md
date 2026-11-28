@@ -66,15 +66,44 @@ next starts.
   `~/.local/share/dumbot/instructions.md`.
 - **Environment variables**, global (sidebar) or per bot (**Environment…**), are for secrets
   and settings. They live in `~/.local/share/dumbot/env.json` (owner-only), outside every
-  bot's folder. Each bot folder's opencode config sets its `shell` to a dumBot wrapper
-  (`~/.local/share/dumbot/shell/<slug>`, running `dumbot shell <slug>`), so every shell
-  command the bot or its subagents run gets them. Bots are told only the names. The wrapper
+  bot's folder; each bot's container sees only its own. Each bot folder's opencode config
+  sets its `shell` to the container's `dumbot-shell` (running `dumbot shell <slug>`), so every
+  shell command the bot or its subagents run gets them. Bots are told only the names. The wrapper
   replaces any value in command output with `[$NAME]`, and permission rules block reading
   `env.json` and dumping the environment. A bot could still put a value somewhere outside
   command output (say, write it into a file and open that with the read tool); its
   instructions forbid that, but it isn't enforced.
 - **Scripts**: bots keep reusable scripts in `scripts/`, which they can run without asking.
   Scripts get the environment variables and show up in the app.
+
+## Containers
+
+Every run happens in the bot's own Docker container (`dumbot-<slug>`), running
+`opencode serve`. Docker is required.
+
+- **Image**: `dumbot-runner:<hash>`, built on your computer the first time a bot runs, so it
+  matches your architecture. It has opencode (your host's version), git, gh, browse and
+  common tools, plus a Linux `dumbot` command line: downloaded from the release matching the
+  app's version, or built from the checkout for development builds. The hash covers the
+  Dockerfile (`src/docker/Dockerfile`), dumBot's version (and source, in development), and
+  the host's opencode and browse versions, so a change to any of them builds a new image.
+- **Mounts**, at the same paths as on the host: the bot's folder, your opencode config
+  (models, auth, agents, skills), a file with the bot's environment variables, a persistent
+  home of its own (`~/.local/share/dumbot/containers/<slug>/home`, where its opencode sessions
+  live), and any folders you add.
+- **Pausing**: containers aren't stopped between runs. One with no working run that isn't the
+  selected bot is paused (`docker pause`) after a minute, and resumed in an instant for the
+  next run or when you select the bot. A container whose image or settings changed is
+  recreated on its next run.
+- **Opt-in per bot** (**Container…**): tools set up from your computer's own (GitHub CLI,
+  logged in with your `gh auth token`; Browse, through the relay on your computer), MCP
+  servers from your opencode config (ones that run a local command are flagged: they run
+  inside the container), and more folders to mount.
+- **Starting** shows each step (checking Docker, building the image, resuming the container,
+  waiting for opencode, …) with its time, live in the run panel and the sidebar.
+- **Issues**: the sidebar shows problems running bots (Docker missing, a failed image build
+  with its log, a container that stopped, a tool that isn't logged in on the host, …).
+  `dumbot doctor` prints the same.
 
 ## Features
 
@@ -119,8 +148,9 @@ without browse still work, but only with what the shell and simple web fetches c
 
 ## Requirements
 
-- [`opencode`](https://opencode.ai) v2. dumBot uses opencode's shared background service
-  (the one the TUI uses) and starts it when it isn't running.
+- [Docker](https://www.docker.com/) (Docker Desktop on macOS). Every run is in a container.
+- [`opencode`](https://opencode.ai) v2 on the host, set up with your providers: containers
+  use its config and auth, and install the same version.
 - Strongly recommended: [Browse](https://opencode.ai/product/browse) from opencode, so bots can use your browser ([how dumBot uses it](#browser-automation-with-browse)).
 
 ## Install
@@ -150,6 +180,7 @@ make run
 make test
 make lint
 cargo test -- --ignored        # also hits the local opencode service and GitHub
+cargo build --no-default-features   # the command line only, as built into the image
 cargo run -- --snap out.png --scene demo --size 1440x900 --theme dark
 ```
 
@@ -157,7 +188,8 @@ cargo run -- --snap out.png --scene demo --size 1440x900 --theme dark
 - `src/bots.rs`: bot folders, `bot.json`, the `dumbot` agent and starting runs.
 - `src/schedule.rs`: parsing and describing wake-up times.
 - `src/cli.rs`: `dumbot wake`, `run` and `list`.
-- `src/opencode.rs`: client for opencode's local HTTP API.
+- `src/container.rs`: the image, bots' containers, pausing, and `dumbot doctor`.
+- `src/opencode.rs`: client for opencode's HTTP API (in each bot's container).
 - `src/store.rs`: app settings (`~/.local/share/dumbot/state.json`).
 - `src/update.rs`, `src/appbundle.rs`: self-update and the macOS app bundle.
 

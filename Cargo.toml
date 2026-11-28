@@ -10,12 +10,18 @@ repository = "https://github.com/vangheem/dumbot"
 anyhow = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-rune = { git = "https://github.com/anomalyco/rune", rev = "e98ea23b788069dcf5327d71a4507ce1a9404bbe" }
-rune-kit = { git = "https://github.com/anomalyco/rune", rev = "e98ea23b788069dcf5327d71a4507ce1a9404bbe", features = ["markdown"] }
-rune-theme-opencode = { git = "https://github.com/anomalyco/rune", rev = "e98ea23b788069dcf5327d71a4507ce1a9404bbe" }
+rune = { optional = true, git = "https://github.com/anomalyco/rune", rev = "e98ea23b788069dcf5327d71a4507ce1a9404bbe" }
+rune-kit = { optional = true, git = "https://github.com/anomalyco/rune", rev = "e98ea23b788069dcf5327d71a4507ce1a9404bbe", features = ["markdown"] }
+rune-theme-opencode = { optional = true, git = "https://github.com/anomalyco/rune", rev = "e98ea23b788069dcf5327d71a4507ce1a9404bbe" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }
+
+[features]
+default = ["gui"]
+# The desktop app. Without it, dumbot is only the command line bots use inside their
+# containers.
+gui = ["dep:rune", "dep:rune-kit", "dep:rune-theme-opencode"]
 
 [profile.dev]
 debug = "line-tables-only"

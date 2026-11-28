@@ -25,3 +25,5 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       # Tests that reach GitHub or opencode are #[ignore]d and don't run here.
       - run: cargo test
+      # The command line that runs inside bots' containers.
+      - run: cargo clippy --no-default-features --all-targets -- -D warnings

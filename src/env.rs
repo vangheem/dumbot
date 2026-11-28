@@ -1,15 +1,15 @@
 //! Environment variables for bots' shell commands, global and per bot. They're kept in
 //! `~/.local/share/dumbot/env.json` (readable only by the user), outside the bots' folders.
 //!
-//! Each bot's folder has an opencode config whose `shell` is a small wrapper
-//! (`~/.local/share/dumbot/shell/<slug>`) that runs `dumbot shell <slug>`: it adds the variables
-//! and runs the user's shell. opencode uses it for every shell command in the folder, the run's
-//! and its subagents' alike. Bots only ever see the names: the wrapper replaces any value in
+//! Each bot's folder has an opencode config whose `shell` is the container's `dumbot-shell`,
+//! which runs `dumbot shell <slug>`: it adds the variables (from the bot's own `env.json`,
+//! mounted where this one is on the host) and runs the shell. opencode uses it for every shell
+//! command in the folder, the run's and its subagents' alike. Bots only ever see the names: the wrapper replaces any value in
 //! commands' output with `[$NAME]`, so the model never reads one.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -81,31 +81,12 @@ pub fn valid_name(name: &str) -> bool {
         && c.all(|x| x.is_ascii_alphanumeric() || x == '_')
 }
 
-pub fn wrapper_path(slug: &str) -> PathBuf {
-    store::data_dir().join("shell").join(slug)
-}
-
-/// Writes the bot's shell wrapper, returning its path.
-pub fn write_wrapper(slug: &str, exe: &str) -> Result<PathBuf> {
-    let path = wrapper_path(slug);
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    let exe = exe.replace('\'', r"'\''");
-    std::fs::write(
-        &path,
-        format!(
-            "#!/bin/sh\n# Written by dumBot: adds {slug}'s environment variables to its shell commands.\nexec '{exe}' shell {slug} \"$@\"\n"
-        ),
-    )?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
-    Ok(path)
-}
-
-/// The shell to hand commands to: the user's, unless that's a dumBot wrapper.
+/// The shell to hand commands to (the container sets `SHELL`).
 fn real_shell() -> String {
     std::env::var("SHELL")
         .ok()
-        .filter(|s| !s.is_empty() && !PathBuf::from(s).starts_with(store::data_dir()))
-        .unwrap_or_else(|| "/bin/zsh".into())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/bin/sh".into())
 }
 
 /// `dumbot shell <slug> <shell args…>`: runs the user's shell with the bot's variables, hiding

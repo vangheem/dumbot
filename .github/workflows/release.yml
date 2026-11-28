@@ -65,9 +65,36 @@ jobs:
           name: linux
           path: dist/dumbot-linux-x86_64.tar.gz*
 
+  # The headless command line bots' containers download (matching the app's version).
+  linux-cli:
+    name: Linux CLI ${{ matrix.arch }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cli
+      - run: cargo build --release --locked --no-default-features
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -C target/release -czf dist/dumbot-cli-linux-${{ matrix.arch }}.tar.gz dumbot
+          sha256sum dist/dumbot-cli-linux-${{ matrix.arch }}.tar.gz | sed 's|dist/||' > dist/dumbot-cli-linux-${{ matrix.arch }}.tar.gz.sha256
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-cli-${{ matrix.arch }}
+          path: dist/dumbot-cli-linux-*.tar.gz*
+
   publish:
     name: Publish
-    needs: [macos, linux]
+    needs: [macos, linux, linux-cli]
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}

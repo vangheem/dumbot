@@ -3,7 +3,7 @@
 
 use anyhow::{Result, anyhow};
 
-use crate::{bots, opencode, schedule, store};
+use crate::{bots, container, schedule, store};
 
 /// Returns false for anything that isn't one of these commands, so the app runs.
 pub fn run(args: &[String]) -> bool {
@@ -11,6 +11,7 @@ pub fn run(args: &[String]) -> bool {
         Some("wake") => wake(&args[2..]),
         Some("list") => list(),
         Some("run") => run_bot(&args[2..]),
+        Some("doctor") => doctor(),
         // The shell wrapper bots' commands run through (see `env`).
         Some("shell") => match crate::env::run_shell(&args[2..]) {
             Ok(code) => std::process::exit(code),
@@ -33,7 +34,8 @@ const USAGE: &str = "dumBot: bots that rewrite themselves, run through opencode.
 
   dumbot                         open the app
   dumbot list                    list bots and when they wake
-  dumbot run <bot> [message]     start a run now and print its session id
+  dumbot run <bot> [message]     start a run now (in its container) and print its session id
+  dumbot doctor                  check Docker, the bot image and each bot's container
   dumbot wake <bot> <when> [--note TEXT]
         <when>: now | in 30m | in 1h30m | at 09:00 | at 2026-12-01 09:00 | every 6h
                 | on wed,thu at 19:00 | on weekends at 10:00,18:00 | off
@@ -75,17 +77,39 @@ fn run_bot(args: &[String]) -> Result<()> {
     let slug = bots::slugify(bot);
     let b = bots::load(&slug)?;
     let message = (args.len() > 1).then(|| args[1..].join(" "));
-    let oc = opencode::Client::connect()?;
     let id = bots::start_run(
-        &oc,
         &slug,
         &b,
         "started from the command line",
         &[],
         message.as_deref(),
         store::Store::load().model,
+        &|s| eprintln!("{s}…"),
     )?;
     println!("{id}");
+    Ok(())
+}
+
+fn doctor() -> Result<()> {
+    if let Ok(v) = container::check_docker() {
+        println!("Docker {v}");
+    }
+    let issues = container::doctor(&bots::list());
+    if issues.is_empty() {
+        println!("No issues.");
+    }
+    for i in &issues {
+        let who = i.bot.as_deref().unwrap_or("all bots");
+        let kind = if i.warning { "warning" } else { "problem" };
+        println!(
+            "{kind} ({who}): {}
+    fix: {}",
+            i.problem, i.fix
+        );
+    }
+    if issues.iter().any(|i| !i.warning) {
+        std::process::exit(1);
+    }
     Ok(())
 }
 

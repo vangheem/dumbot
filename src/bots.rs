@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-use crate::opencode::Client;
 use crate::store::{self, ModelRef};
 
 /// How many past runs a bot remembers.
@@ -49,6 +48,33 @@ pub struct Bot {
     /// Oldest first.
     #[serde(default)]
     pub runs: Vec<Run>,
+    /// What the bot's container gets besides opencode.
+    #[serde(default, skip_serializing_if = "Sandbox::is_empty")]
+    pub sandbox: Sandbox,
+}
+
+/// The optional parts of a bot's container, all opt-in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sandbox {
+    /// Tools set up from the host's own (`gh`, `browse`); see `container::TOOLS`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    /// MCP servers from the host's opencode config, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp: Vec<String>,
+    /// More host folders, mounted read-write at the same path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<String>,
+}
+
+impl Sandbox {
+    pub fn is_empty(&self) -> bool {
+        self == &Sandbox::default()
+    }
+
+    pub fn has_tool(&self, id: &str) -> bool {
+        self.tools.iter().any(|t| t == id)
+    }
 }
 
 /// A weekly wake-up: these days at this local time.
@@ -202,7 +228,7 @@ pub fn delete(slug: &str) -> Result<()> {
     if env.bots.remove(slug).is_some() {
         env.save()?;
     }
-    let _ = std::fs::remove_file(crate::env::wrapper_path(slug));
+    crate::container::remove(slug);
     let d = dir(slug);
     std::fs::remove_dir_all(&d).with_context(|| format!("remove {}", d.display()))
 }
@@ -293,7 +319,7 @@ pub fn prepare(slug: &str, bot: &Bot) -> Result<()> {
     }
     std::fs::create_dir_all(d.join("memory/work"))?;
     std::fs::create_dir_all(d.join("scripts"))?;
-    let (dir, exe) = (d.display().to_string(), exe());
+    let dir = d.display().to_string();
     let (user, env) = (user_section(), env_section(slug));
     for (rel, template) in MANAGED {
         let path = d.join(rel);
@@ -303,20 +329,21 @@ pub fn prepare(slug: &str, bot: &Bot) -> Result<()> {
             .replace("{name}", &bot.name)
             .replace("{dir}", &dir)
             .replace("{data}", &store::data_dir().display().to_string())
-            .replace("{exe}", &exe)
+            .replace("{exe}", "dumbot")
             .replace("{slug}", slug)
             .replace("{env_section}", &env)
             .replace("{user_section}", &user);
         std::fs::write(path, body)?;
     }
     // Every shell command in the folder (the run's and its subagents') goes through the
-    // wrapper, which adds the bot's environment variables.
-    let shell = crate::env::write_wrapper(slug, &exe)?;
+    // container's wrapper, which adds the bot's environment variables; and only the MCP
+    // servers the bot opted in to are on.
     std::fs::write(
         d.join(".opencode/opencode.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "$schema": "https://opencode.ai/config.json",
-            "shell": shell,
+            "shell": "/usr/local/bin/dumbot-shell",
+            "mcp": crate::container::mcp_config(bot),
         }))?,
     )?;
     Ok(())
@@ -352,12 +379,6 @@ fn env_section(slug: &str) -> String {
     )
 }
 
-fn exe() -> String {
-    crate::appbundle::target_binary()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "dumbot".into())
-}
-
 /// The first prompt of a run: why it's running, the notes left for the wake-ups that woke
 /// it, and the time. Its first line is shown in place of the whole thing.
 pub fn preamble(reason: &str, notes: &[String]) -> String {
@@ -371,21 +392,26 @@ pub fn preamble(reason: &str, notes: &[String]) -> String {
     format!("{RUN_PREFIX}{reason}\n{note}\nIt is now {now}. Begin your run.")
 }
 
-/// Starts a run of a bot in a fresh session of the `dumbot` agent, with `message` from the
-/// user if any, and returns the session id. The bot's own model wins over `default`.
+/// Starts a run of a bot in a fresh session of the `dumbot` agent in its container, with
+/// `message` from the user if any, and returns the session id. The bot's own model wins over
+/// `default`. `step` hears what it's doing meanwhile.
 pub fn start_run(
-    oc: &Client,
     slug: &str,
     bot: &Bot,
     reason: &str,
     notes: &[String],
     message: Option<&str>,
     default: Option<ModelRef>,
+    step: crate::container::Step,
 ) -> Result<String> {
+    step("Preparing the bot's folder");
     prepare(slug, bot)?;
+    let oc = crate::container::ensure(slug, bot, step)?;
+    step("Loading the bot's agent");
     oc.await_agent(&dir(slug), AGENT)?;
     let model = bot.model.clone().or(default);
     let title = format!("{}: {reason}", bot.name);
+    step("Creating the session");
     let id = oc.create_session(&title, &dir(slug), AGENT, model.as_ref())?;
     add_run(
         slug,
@@ -399,6 +425,7 @@ pub fn start_run(
     if let Some(m) = message {
         text = format!("{text}\n\n{MESSAGE_MARK}{m}");
     }
+    step("Sending the first prompt");
     oc.prompt(&id, &text)?;
     Ok(id)
 }

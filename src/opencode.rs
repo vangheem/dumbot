@@ -123,6 +123,36 @@ impl Client {
         Ok(c)
     }
 
+    /// A server at `url` (a bot's container) that wants `password`.
+    pub fn new(url: &str, password: &str) -> Client {
+        let auth = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("opencode:{password}"))
+        );
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(30))
+            .build();
+        Client {
+            url: url.trim_end_matches('/').to_string(),
+            auth,
+            agent,
+        }
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Whether the server answers.
+    pub fn healthy(&self) -> bool {
+        self.agent
+            .get(&format!("{}/api/info", self.url))
+            .set("Authorization", &self.auth)
+            .timeout(Duration::from_secs(2))
+            .call()
+            .is_ok()
+    }
+
     fn from_file() -> Result<Client> {
         let raw = std::fs::read(service_file()).context("opencode service is not registered")?;
         let v: Value = serde_json::from_slice(&raw)?;
@@ -131,15 +161,7 @@ impl Client {
             .ok_or_else(|| anyhow!("service.json has no url"))?
             .trim_end_matches('/')
             .to_string();
-        let password = v["password"].as_str().unwrap_or("");
-        let auth = format!(
-            "Basic {}",
-            base64::engine::general_purpose::STANDARD.encode(format!("opencode:{password}"))
-        );
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(30))
-            .build();
-        Ok(Client { url, auth, agent })
+        Ok(Client::new(&url, v["password"].as_str().unwrap_or("")))
     }
 
     fn get(&self, path: &str) -> Result<Value> {
@@ -218,6 +240,38 @@ impl Client {
     }
 
     /// Enabled models as `(provider/id, name, provider)`, sorted by provider then name.
+    /// Stored integration credentials (providers' and MCP servers' logins), secrets included.
+    pub fn credentials(&self) -> Result<Vec<Value>> {
+        Ok(self.get("/api/credential")?["data"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Stores `entry` (as `credentials` lists it) under the same id, replacing any there.
+    pub fn put_credential(&self, entry: &Value, replace: bool) -> Result<()> {
+        let id = entry["id"].as_str().unwrap_or_default();
+        if replace {
+            let r = self
+                .agent
+                .delete(&format!("{}/api/credential/{id}", self.url))
+                .set("Authorization", &self.auth)
+                .call();
+            map_err(r)?;
+        }
+        self.post(
+            "/api/credential",
+            json!({
+                "id": id,
+                "integrationID": entry["integrationID"],
+                "label": entry["label"],
+                "value": entry["value"],
+                "activate": entry["active"].as_bool().unwrap_or(true),
+            }),
+        )?;
+        Ok(())
+    }
+
     pub fn models(&self) -> Result<Vec<(String, String, String)>> {
         let v = self.get("/api/model")?;
         let mut out: Vec<_> = v["data"]
