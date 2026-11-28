@@ -191,6 +191,165 @@ fn parse_add(args: &[String]) -> Result<Value> {
     }
 }
 
+/// A server as the app's form shows it: a URL and headers, or a command and environment
+/// variables; headers and variables one per line (`Name: value`, `NAME=value`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Form {
+    pub name: String,
+    pub remote: bool,
+    /// The URL, or the command line.
+    pub target: String,
+    pub extra: String,
+}
+
+impl Form {
+    pub fn of(name: &str, v: &Value) -> Form {
+        let remote = v["type"] != "local";
+        let pairs = |key: &str, sep: &str| {
+            v[key]
+                .as_object()
+                .map(|o| {
+                    o.iter()
+                        .map(|(k, x)| format!("{k}{sep}{}", x.as_str().unwrap_or_default()))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default()
+        };
+        Form {
+            name: name.into(),
+            remote,
+            target: if remote {
+                v["url"].as_str().unwrap_or_default().into()
+            } else {
+                join_command(
+                    &v["command"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(String::from))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                )
+            },
+            extra: if remote {
+                pairs("headers", ": ")
+            } else {
+                pairs("environment", "=")
+            },
+        }
+    }
+
+    /// The server, keeping whatever else `base` (the server being edited) had.
+    pub fn server(&self, base: Option<&Value>) -> Result<(String, Value)> {
+        let name = self.name.trim();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_".contains(c))
+        {
+            return Err(anyhow!("name it with letters, digits, - and _"));
+        }
+        let mut v = base.cloned().unwrap_or_else(|| serde_json::json!({}));
+        let o = v.as_object_mut().ok_or_else(|| anyhow!("not a server"))?;
+        for k in ["url", "headers", "command", "environment"] {
+            o.remove(k);
+        }
+        let (sep, key) = if self.remote {
+            (':', "headers")
+        } else {
+            ('=', "environment")
+        };
+        let mut extra = serde_json::Map::new();
+        for line in self.extra.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let (k, x) = line.split_once(sep).ok_or_else(|| {
+                anyhow!(if self.remote {
+                    "write headers as Name: value"
+                } else {
+                    "write variables as NAME=value"
+                })
+            })?;
+            extra.insert(k.trim().into(), x.trim().into());
+        }
+        if self.remote {
+            o.insert("type".into(), "remote".into());
+            o.insert("url".into(), self.target.trim().into());
+        } else {
+            let cmd = split_command(&self.target);
+            if cmd.is_empty() {
+                return Err(anyhow!("enter the command that runs the server"));
+            }
+            o.insert("type".into(), "local".into());
+            o.insert("command".into(), cmd.into());
+        }
+        if !extra.is_empty() {
+            o.insert(key.into(), Value::Object(extra));
+        }
+        let one = Servers::from([(name.to_string(), v)]);
+        parse(&serde_json::to_string(&one)?)?;
+        let (name, v) = one.into_iter().next().unwrap();
+        Ok((name, v))
+    }
+}
+
+/// Splits a command line on spaces, keeping quoted parts ('…' or "…") together.
+pub fn split_command(s: &str) -> Vec<String> {
+    let (mut out, mut cur, mut quote, mut any) = (Vec::new(), String::new(), None, false);
+    for c in s.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => cur.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                any = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if any || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                    any = false;
+                }
+            }
+            (None, c) => cur.push(c),
+        }
+    }
+    if any || !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+pub fn join_command(parts: &[String]) -> String {
+    parts
+        .iter()
+        .map(|p| {
+            if p.is_empty() || p.contains(char::is_whitespace) {
+                format!("\"{p}\"")
+            } else {
+                p.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// What a server is, in a line: its URL, or its command.
+pub fn summary(v: &Value) -> String {
+    match v["url"].as_str() {
+        Some(u) => u.to_string(),
+        None => join_command(
+            &v["command"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        ),
+    }
+}
+
 /// Parses the JSON object the app edits, checking each server says what it is.
 pub fn parse(text: &str) -> Result<Servers> {
     if text.trim().is_empty() {
@@ -217,6 +376,13 @@ pub fn parse(text: &str) -> Result<Servers> {
 mod tests {
     use super::*;
 
+    impl Form {
+        fn tap_extra(mut self) -> Form {
+            self.extra = self.extra.trim().to_string();
+            self
+        }
+    }
+
     #[test]
     fn bots_own_servers_win() {
         let mut m = BotMcp::default();
@@ -235,6 +401,38 @@ mod tests {
         assert!(parse(r#"{"c": {"type": "remote"}}"#).is_err());
         m.set(Some("x"), Servers::new());
         assert!(m.bots.is_empty());
+        assert_eq!(
+            split_command(r#"npx -y "my pkg" --flag='a b'"#),
+            ["npx", "-y", "my pkg", "--flag=a b"]
+        );
+        let base = serde_json::json!({ "type": "local", "command": ["x"], "timeout": 5 });
+        let f = Form {
+            name: "tool".into(),
+            remote: false,
+            target: r#"npx -y "my pkg""#.into(),
+            extra: "TOKEN={env:TOKEN}\n".into(),
+        };
+        let (n, v) = f.server(Some(&base)).unwrap();
+        assert_eq!(n, "tool");
+        assert_eq!(v["timeout"], 5);
+        assert_eq!(v["environment"]["TOKEN"], "{env:TOKEN}");
+        assert_eq!(Form::of(&n, &v), f.clone().tap_extra());
+        let r = Form {
+            name: "r".into(),
+            remote: true,
+            target: "https://x/mcp".into(),
+            extra: "Authorization: Bearer t".into(),
+        };
+        let (_, v) = r.server(None).unwrap();
+        assert_eq!(v["headers"]["Authorization"], "Bearer t");
+        assert!(
+            Form {
+                name: "bad name".into(),
+                ..r
+            }
+            .server(None)
+            .is_err()
+        );
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         let mut v = parse_add(&s(&[
             "--url",

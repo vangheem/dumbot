@@ -61,12 +61,13 @@ from source into `~/.local/bin`.
 ## Getting started
 
 1. Run `dumbot` to open the app.
-2. Set up [Browse](https://opencode.ai/product/browse) so bots can use your browser.
+2. Set up [Browse](https://opencode.ai/product/browse) so bots can use your browser (bots on a
+   server use [the server browser](#the-server-browser) instead).
 3. **New bot** (⌘N): give it a name and describe what it's for ("Every morning, check my
    Gmail, archive newsletters and summarize what needs a reply"). Its first run works out
    how to do the job, rewrites its own instructions and picks its schedule.
-4. Give it what it needs: secrets as **Environment…** variables, documents with **Upload
-   files…**, tools under **Container…**.
+4. Give it what it needs from the bot's **•••** menu: secrets (**Environment…**), documents
+   (**Upload…**), MCP servers (**MCP…**) and tools (**Container…**).
 
 ## Features
 
@@ -79,21 +80,22 @@ from source into `~/.local/bin`.
   next time and note, to remove any of them or add one: once on a day and time, weekly on
   chosen days, or repeating every so many minutes, hours or days.
 - **Run now** (with the composer text as a message, if any).
-- **Upload files…** / **Upload folder…** (or drop them on the bot) copy files into the bot's
-  `files/`, wherever it runs, for it to use and refer to; the Files tab lists them.
+- **Upload…** in the bot's **•••** menu (or drop files and folders on the bot) copies them into
+  the bot's `files/`, wherever it runs, for it to use and refer to; the Files tab lists them.
 - A default model (bottom of the sidebar) and a model per bot. Changing either also switches
   the bot's latest run, so a run that's working or that you message next uses it.
 
 ## Bots on a server
 
 The app can manage bots that run on another machine (a home server, a VPS), which runs them on
-schedule while your computer is off or the app is closed.
+schedule while your computer is off or the app is closed, with a browser of its own.
 
 ```sh
 # On the server (Linux with systemd, or macOS), with Docker:
 dumbot install-server          # runs `dumbot server` now and at boot (port 7457)
 dumbot server approve <code>   # pairs an app (the app shows the code)
 dumbot server clients          # paired apps; `dumbot server revoke <fingerprint>` unpairs
+dumbot server tunnel <host>    # reach it from anywhere through Cloudflare (below)
 ```
 
 In the app, **Server…** (bottom of the sidebar) connects to it (or `dumbot connect <host>`).
@@ -109,9 +111,39 @@ In the app, **Server…** (bottom of the sidebar) connects to it (or `dumbot con
   skills, MCP servers), logins, opencode version, GitHub CLI token, git identity and time
   zone, which the app sends when it connects and every 10 minutes. The server keeps the latest
   (owner-only) for runs while the app is closed.
-- **Browse** is carried back to your computer: the server listens on your relay's port on its
-  loopback and the app tunnels each connection (over the same TLS) to your browse relay, so
-  bots on the server use your browser, and hand tabs back to you, while the app is open.
+- **It all comes back after a reboot**: the server and tunnel are services (systemd with
+  lingering, or launchd), the server browser restarts with Docker, and pairings, bots and
+  logins are files on the server.
+
+### The server browser
+
+Bots on a server use a real Chrome running on the server (Linux x86_64), with the browse
+extension and relay, set up and paired by itself the first time the server starts
+(`dumbot-browser` container). It works while your computer is off.
+
+- **Signing in**: **Server browser** in the sidebar opens it in your own browser (a remote view,
+  carried over the paired connection; nothing is exposed on the network). Sign in to the sites
+  your bots use once: Chrome's profile lives in `~/.local/share/dumbot/browser` on the server,
+  so logins survive restarts, reboots and updates (Chrome saves new cookies within about 30
+  seconds).
+- **Handoffs**: when a bot needs you (a login, 2FA, a captcha), the app tells you (and shows
+  it under **Server browser**); open the browser, do your part and click **Continue** on the
+  page. A bot whose handoff times out leaves that part for a later run.
+- Chrome keeps its own sandbox (the container runs with Docker's seccomp filter off instead of
+  Chrome's `--no-sandbox`). The relay and the viewer listen on the server's loopback only.
+
+### From anywhere: a Cloudflare tunnel
+
+```sh
+cloudflared tunnel login                         # once, if cloudflared isn't logged in yet
+dumbot server tunnel bots.example.com            # on the server
+```
+
+It creates a tunnel of its own (`dumbot`), points the hostname at it and runs it as a service.
+In the app, change the server's address to `wss://bots.example.com`. The connection is a
+WebSocket through Cloudflare, with the same pinned TLS inside it: Cloudflare carries it but
+can't read or change it. Changing the address keeps the pairing, and the app only accepts the
+server it paired with, so a wrong address can't stand in for it.
 
 ## Browser automation with browse
 
@@ -141,11 +173,11 @@ without browse still work, but only with what the shell and simple web fetches c
 
 ## Instructions, environment variables and scripts
 
-- **Instructions for all bots** (sidebar) is markdown added to every bot's system prompt, and
+- **Instructions** (sidebar) is markdown added to every bot's system prompt, and
   its subagents'. Use it for what every bot should know: "I have Gotify at …; the token is in
   `$GOTIFY_TOKEN`", your time zone, house rules. It's kept in
   `~/.local/share/dumbot/instructions.md`.
-- **Environment variables**, global (sidebar) or per bot (**Environment…**), are for secrets
+- **Environment variables**, global (sidebar) or per bot (••• › **Environment…**), are for secrets
   and settings. They live in `~/.local/share/dumbot/env.json` (owner-only), outside every
   bot's folder; each bot's container sees only its own. Each bot folder's opencode config
   sets its `shell` to the container's `dumbot-shell` (running `dumbot shell <slug>`), so every
@@ -159,9 +191,10 @@ without browse still work, but only with what the shell and simple web fetches c
 
 ## MCP servers for bots
 
-Besides the MCP servers in your opencode config (turned on per bot under **Container…**),
-bots can have MCP servers of their own, in opencode's `mcp` format: for every bot (**MCP
-servers for bots** in the sidebar) or one bot (**Container…**). They're kept in
+Besides the MCP servers in your opencode config (turned on per bot under ••• ›
+**Container…**), bots can have MCP servers of their own: for every bot (**MCP** in the sidebar)
+or one bot (••• › **MCP…**). Add a remote server by URL (with headers) or a local one by
+command (with environment variables); `{env:NAME}` fills in one of your variables. They're kept in
 `~/.local/share/dumbot/mcp.json` (owner-only) where the bots run, and only bots get them.
 
 Bots can also install MCP servers for themselves: `dumbot mcp <bot> add <name> --url …` or
@@ -236,7 +269,7 @@ Every run happens in the bot's own Docker container (`dumbot-<slug>`), running
   selected bot is paused (`docker pause`) after a minute, and resumed in an instant for the
   next run or when you select the bot. A container whose image or settings changed is
   recreated on its next run.
-- **Opt-in per bot** (**Container…**): tools set up from your computer's own (GitHub CLI,
+- **Opt-in per bot** (••• › **Container…**): tools set up from your computer's own (GitHub CLI,
   logged in with your `gh auth token`; Browse, through the relay on your computer), MCP
   servers from your opencode config (ones that run a local command are flagged: they run
   inside the container), and more folders to mount.
@@ -265,8 +298,10 @@ cargo run -- --snap out.png --scene demo --size 1440x900 --theme dark
 - `src/container.rs`: the image, bots' containers, pausing, and `dumbot doctor`.
 - `src/opencode.rs`: client for opencode's HTTP API (in each bot's container).
 - `src/api.rs`: every request the app makes, handled in-process or by a server.
-- `src/remote.rs`, `src/server.rs`, `src/tunnel.rs`: pairing and TLS, `dumbot server` and
-  its service, and carrying browse back to the app.
+- `src/remote.rs`, `src/transport.rs`, `src/server.rs`: pairing and TLS (over TCP, or a
+  WebSocket through a proxy), `dumbot server`, its service and its Cloudflare tunnel.
+- `src/browser.rs`, `src/view.rs`, `src/docker/browser.Dockerfile`: the server browser and
+  its remote view.
 - `src/context.rs`: what a server's bots take from the app's computer.
 - `src/mcp.rs`: bot-only MCP servers.
 - `src/store.rs`: app settings (`~/.local/share/dumbot/state.json`).

@@ -58,6 +58,10 @@ pub enum Request {
         value: Option<String>,
     },
     BotMcp,
+    /// The MCP servers a bot installed for itself.
+    InstalledMcp {
+        slug: String,
+    },
     SaveBotMcp {
         bot: Option<String>,
         servers: mcp::Servers,
@@ -133,6 +137,9 @@ pub struct Status {
     /// Bots whose run is being started here, with the step it's on.
     pub starting: BTreeMap<String, String>,
     pub default_model: Option<ModelRef>,
+    /// The server browser, on a server.
+    #[serde(default)]
+    pub browser: Option<crate::browser::Info>,
 }
 
 pub type Step<'a> = &'a (dyn Fn(&str) + Sync);
@@ -291,6 +298,8 @@ pub fn handle(req: Request, step: Step) -> Result<Value> {
                 active,
                 starting: starting(),
                 default_model: Store::load().model,
+                browser: (crate::context::current().is_some() && crate::browser::supported())
+                    .then(crate::browser::info),
             })
         }
         Request::Files { slug } => to(bots::files(&slug)),
@@ -343,6 +352,7 @@ pub fn handle(req: Request, step: Step) -> Result<Value> {
             handle(Request::Env, step)
         }
         Request::BotMcp => to(mcp::load()),
+        Request::InstalledMcp { slug } => to(mcp::installed(&slug)),
         Request::SaveBotMcp { bot, servers } => {
             let mut m = mcp::load();
             m.set(bot.as_deref(), servers);
@@ -399,8 +409,6 @@ pub fn handle(req: Request, step: Step) -> Result<Value> {
         Request::Doctor => to(container::doctor(&bots::list())),
         Request::SyncContext { context } => {
             crate::context::save(&context)?;
-            // The app's relay port may be new.
-            crate::tunnel::listen()?;
             ok(Value::Null)
         }
         Request::Upload { slug, files } => {
@@ -552,36 +560,20 @@ mod tests {
         assert!(matches!(back, Request::UpdateBot { .. }));
     }
 
-    /// Against a paired server, with a data dir (`DUMBOT_DATA_DIR`) paired to
-    /// it (`dumbot connect`): `cargo test remote_bot -- --ignored --nocapture`. A bot on the
-    /// server reads a page through this computer's browser.
+    /// Against a paired server, with a data dir (`DUMBOT_DATA_DIR`) paired to it
+    /// (`dumbot connect`): `cargo test remote_bot -- --ignored --nocapture`. A bot on the
+    /// server reads a page with the server browser, on its own.
     #[test]
     #[ignore]
     fn remote_bot_runs_on_the_server() {
         let server = Store::load()
             .remote
             .expect("pair with `dumbot connect` first");
-        let b = Backend::Remote(server.clone());
+        let b = Backend::Remote(server);
         b.call::<()>(Request::SyncContext {
             context: crate::context::gather(),
         })
         .unwrap();
-        crate::tunnel::carry(Some(server));
-        std::thread::sleep(Duration::from_secs(3));
-        assert!(
-            std::process::Command::new("ssh")
-                .args([
-                    "nathan@192.168.86.36",
-                    &format!(
-                        "curl -sSf -m 5 http://127.0.0.1:{}/version",
-                        crate::container::browse_port().unwrap()
-                    ),
-                ])
-                .status()
-                .unwrap()
-                .success(),
-            "the relay isn't reachable through the tunnel"
-        );
         let slug: String = b
             .call(Request::Create {
                 name: "Remote test".into(),
@@ -590,14 +582,6 @@ mod tests {
                     .into(),
             })
             .unwrap();
-        b.call::<Bot>(Request::UpdateBot {
-            slug: slug.clone(),
-            change: Change::Sandbox(Sandbox {
-                tools: vec!["browse".into()],
-                ..Sandbox::default()
-            }),
-        })
-        .unwrap();
         let id: String = b
             .call_with(
                 Request::StartRun {
@@ -611,6 +595,7 @@ mod tests {
             .unwrap();
         let st: Status = b.call(Request::Status).unwrap();
         assert!(st.bots.contains_key(&slug));
+        assert_eq!(st.browser.unwrap().problem, None);
         let started = Instant::now();
         let snap = loop {
             std::thread::sleep(Duration::from_secs(5));
@@ -625,7 +610,7 @@ mod tests {
             }
         };
         for e in &snap.entries {
-            eprintln!("{e:?}");
+            eprintln!("{}", format!("{e:?}").chars().take(200).collect::<String>());
         }
         b.call::<()>(Request::Delete { slug }).unwrap();
         use crate::opencode::Entry;

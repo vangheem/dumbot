@@ -13,7 +13,8 @@ use rune_kit::shell::{
 };
 use rune_kit::{
     Button, ButtonVariant, Combobox, ComboboxOption, ComboboxState, ControlSize, Dialog,
-    IconButton, IconButtonVariant, Kit, Markdown, SegmentedControl, Spinner, TextArea, TextInput,
+    IconButton, IconButtonVariant, Kit, Markdown, Menu, MenuItem, SegmentedControl, Spinner,
+    TextArea, TextInput,
 };
 
 use crate::api::{self, Backend, Change, Request, SessionAction};
@@ -109,9 +110,30 @@ struct ConnectEdit {
     error: Option<String>,
 }
 
-/// The bot-only MCP servers for all bots, as JSON, being edited.
+/// The MCP dialog: bot-only servers for every bot (`bot` none) or one bot, and the form to
+/// add or change one. Changes are saved as they're made.
 struct McpEdit {
-    text: TextEdit,
+    bot: Option<String>,
+    servers: mcp::Servers,
+    /// For a bot: the names of every bot's servers, and the servers it installed itself.
+    global: Vec<String>,
+    installed: mcp::Servers,
+    /// The server the form edits; a new one when unset.
+    editing: Option<String>,
+    name: TextEdit,
+    remote: bool,
+    target: TextEdit,
+    extra: TextEdit,
+}
+
+impl McpEdit {
+    fn set_form(&mut self, f: mcp::Form, editing: Option<String>) {
+        self.editing = editing;
+        self.name = TextEdit::new(f.name);
+        self.remote = f.remote;
+        self.target = TextEdit::new(f.target);
+        self.extra = TextEdit::new(f.extra);
+    }
 }
 
 /// A bot start's lifecycle: each step and when it began, then when it ended and how.
@@ -128,10 +150,6 @@ struct SandboxEdit {
     mounts: TextEdit,
     /// The host's MCP servers, with why each may not work in a container.
     servers: Vec<(String, Option<String>)>,
-    /// MCP servers only this bot gets, as JSON.
-    own_mcp: TextEdit,
-    /// Names of the bot-only servers every bot gets.
-    global_mcp: Vec<String>,
 }
 
 /// How long an idle container stays unpaused, in seconds.
@@ -140,15 +158,6 @@ const PAUSE_AFTER_SECS: f64 = 60.0;
 const DOCTOR_SECS: f64 = 60.0;
 /// How often a server is sent this computer's opencode config and logins, in seconds.
 const CONTEXT_PUSH_SECS: f64 = 600.0;
-
-/// Servers as the JSON the MCP editors show.
-fn servers_json(s: &mcp::Servers) -> String {
-    if s.is_empty() {
-        String::new()
-    } else {
-        serde_json::to_string_pretty(s).unwrap_or_default()
-    }
-}
 
 struct App {
     store: Store,
@@ -166,6 +175,13 @@ struct App {
     next_pair: f64,
     next_context_push: f64,
     mcp_edit: Option<McpEdit>,
+    /// The server browser (connected to a server), and the handoffs already announced.
+    server_browser: Option<crate::browser::Info>,
+    seen_handoffs: HashSet<u64>,
+    /// The bot's ••• menu is open.
+    bot_menu: bool,
+    /// The upload dialog is open (for the selected bot).
+    upload_open: bool,
     moving: bool,
     next_models: f64,
     /// Each bot's container state (`running`, `paused`, …), from the last scan.
@@ -239,6 +255,10 @@ fn init() -> App {
         next_pair: 0.0,
         next_context_push: 0.0,
         mcp_edit: None,
+        server_browser: None,
+        seen_handoffs: HashSet::new(),
+        bot_menu: false,
+        upload_open: false,
         moving: false,
         next_models: 0.0,
         containers: HashMap::new(),
@@ -864,30 +884,101 @@ impl App {
         }
     }
 
-    fn open_mcp(&mut self) {
-        match self.backend.call::<mcp::BotMcp>(Request::BotMcp) {
-            Ok(m) => {
-                self.mcp_edit = Some(McpEdit {
-                    text: TextEdit::new(servers_json(&m.global)),
-                })
-            }
-            Err(e) => self.notify(format!("{e:#}"), true),
-        }
+    /// `None` for every bot's servers.
+    fn open_mcp(&mut self, bot: Option<String>) {
+        let all = match self.backend.call::<mcp::BotMcp>(Request::BotMcp) {
+            Ok(m) => m,
+            Err(e) => return self.notify(format!("{e:#}"), true),
+        };
+        let installed = match &bot {
+            Some(slug) => match self
+                .backend
+                .call::<mcp::Servers>(Request::InstalledMcp { slug: slug.clone() })
+            {
+                Ok(m) => m,
+                Err(e) => return self.notify(format!("{e:#}"), true),
+            },
+            None => mcp::Servers::new(),
+        };
+        let servers = match &bot {
+            Some(slug) => all.bots.get(slug).cloned().unwrap_or_default(),
+            None => all.global.clone(),
+        };
+        let mut e = McpEdit {
+            global: if bot.is_some() {
+                all.global.keys().cloned().collect()
+            } else {
+                Vec::new()
+            },
+            bot,
+            servers,
+            installed,
+            editing: None,
+            name: TextEdit::new(""),
+            remote: true,
+            target: TextEdit::new(""),
+            extra: TextEdit::new(""),
+        };
+        e.set_form(
+            mcp::Form {
+                remote: true,
+                ..Default::default()
+            },
+            None,
+        );
+        self.mcp_edit = Some(e);
     }
 
-    fn save_mcp(&mut self) {
+    /// Adds the form's server, or saves the one being edited.
+    fn save_mcp_form(&mut self) {
         let Some(e) = &self.mcp_edit else { return };
-        let servers = match mcp::parse(&e.text.text) {
-            Ok(s) => s,
+        let form = mcp::Form {
+            name: e.name.text.clone(),
+            remote: e.remote,
+            target: e.target.text.clone(),
+            extra: e.extra.text.clone(),
+        };
+        let base = e.editing.as_ref().and_then(|n| e.servers.get(n));
+        let (name, server) = match form.server(base) {
+            Ok(x) => x,
             Err(err) => return self.notify(format!("{err:#}"), true),
         };
-        match self
-            .backend
-            .call::<mcp::BotMcp>(Request::SaveBotMcp { bot: None, servers })
-        {
+        if e.editing.as_deref() != Some(name.as_str()) && e.servers.contains_key(&name) {
+            return self.notify(format!("There's already a server called {name}."), true);
+        }
+        let mut servers = e.servers.clone();
+        if let Some(old) = &e.editing {
+            servers.remove(old);
+        }
+        servers.insert(name, server);
+        self.save_mcp(servers);
+    }
+
+    fn remove_mcp(&mut self, name: &str) {
+        let Some(e) = &self.mcp_edit else { return };
+        let mut servers = e.servers.clone();
+        servers.remove(name);
+        self.save_mcp(servers);
+    }
+
+    fn save_mcp(&mut self, servers: mcp::Servers) {
+        let Some(e) = &self.mcp_edit else { return };
+        let req = Request::SaveBotMcp {
+            bot: e.bot.clone(),
+            servers: servers.clone(),
+        };
+        match self.backend.call::<mcp::BotMcp>(req) {
             Ok(_) => {
-                self.mcp_edit = None;
-                self.notify("Saved. Bots get these from their next run.", false);
+                if let Some(e) = &mut self.mcp_edit {
+                    e.servers = servers;
+                    e.set_form(
+                        mcp::Form {
+                            remote: true,
+                            ..Default::default()
+                        },
+                        None,
+                    );
+                }
             }
             Err(err) => self.notify(format!("Couldn't save: {err:#}"), true),
         }
@@ -902,10 +993,6 @@ impl App {
             .get(&slug)
             .map(|b| b.sandbox.clone())
             .unwrap_or_default();
-        let bot_mcp = match self.backend.call::<mcp::BotMcp>(Request::BotMcp) {
-            Ok(m) => m,
-            Err(e) => return self.notify(format!("{e:#}"), true),
-        };
         let mut servers: Vec<(String, Option<String>)> = container::host_mcp()
             .into_iter()
             .filter(|(name, _)| name != "browse")
@@ -917,40 +1004,18 @@ impl App {
                 servers.push((m.clone(), Some("isn't in your opencode config".into())));
             }
         }
-        let slug_for_mcp = slug.clone();
         self.sandbox_edit = Some(SandboxEdit {
             slug,
             mounts: TextEdit::new(sandbox.mounts.join("\n")),
             sandbox,
             servers,
-            own_mcp: TextEdit::new(servers_json(
-                bot_mcp
-                    .bots
-                    .get(&slug_for_mcp)
-                    .unwrap_or(&mcp::Servers::new()),
-            )),
-            global_mcp: bot_mcp.global.keys().cloned().collect(),
         });
     }
 
     fn save_sandbox(&mut self) {
-        let Some(own) = self.sandbox_edit.as_ref().map(|e| e.own_mcp.text.clone()) else {
-            return;
-        };
-        let own = match mcp::parse(&own) {
-            Ok(s) => s,
-            Err(err) => return self.notify(format!("This bot's MCP servers: {err:#}"), true),
-        };
         let Some(e) = self.sandbox_edit.take() else {
             return;
         };
-        let req = Request::SaveBotMcp {
-            bot: Some(e.slug.clone()),
-            servers: own,
-        };
-        if let Err(err) = self.backend.call::<mcp::BotMcp>(req) {
-            return self.notify(format!("Couldn't save: {err:#}"), true);
-        }
         let mut sandbox = e.sandbox;
         sandbox.mounts = e
             .mounts
@@ -1009,6 +1074,7 @@ impl App {
         if paths.is_empty() {
             return;
         }
+        self.upload_open = false;
         self.busy = true;
         let backend = self.backend.clone();
         self.bg(
@@ -1035,6 +1101,43 @@ impl App {
                 }
             },
         );
+    }
+
+    /// Shows the server browser's state, telling the user when a bot starts waiting on them.
+    fn set_server_browser(&mut self, info: Option<crate::browser::Info>) {
+        if let Some(i) = &info {
+            let new: Vec<&crate::browser::Handoff> = i
+                .handoffs
+                .iter()
+                .filter(|h| !self.seen_handoffs.contains(&h.tab))
+                .collect();
+            if let Some(h) = new.first() {
+                let what = if h.title.is_empty() { &h.url } else { &h.title };
+                let msg = format!("A bot needs you in the server browser: {what}");
+                notify_desktop(&msg);
+                self.notify(
+                    format!("{msg}. Open it from Server browser in the sidebar."),
+                    false,
+                );
+            }
+            self.seen_handoffs = i.handoffs.iter().map(|h| h.tab).collect();
+        }
+        self.server_browser = info;
+    }
+
+    /// Opens the server browser's viewer in the user's browser.
+    fn open_server_browser(&mut self, tx: &mut Tx) {
+        let Backend::Remote(server) = &self.backend else {
+            return;
+        };
+        match crate::view::local_port(server) {
+            Ok(port) => {
+                if let Err(e) = tx.open_url(&crate::view::url(port)) {
+                    self.notify(format!("Couldn't open the server browser: {e:?}"), true);
+                }
+            }
+            Err(e) => self.notify(format!("Couldn't reach the server browser: {e:#}"), true),
+        }
     }
 
     fn open_connect(&mut self) {
@@ -1070,9 +1173,16 @@ impl App {
             c.pinned = None;
             c.code = None;
         }
+        // A new address for the server this app is paired with keeps its key: the address
+        // may change (a tunnel, a new IP), the server may not.
+        let known = self
+            .store
+            .remote
+            .as_ref()
+            .and_then(|r| r.fingerprint.clone());
         let server = c.pinned.clone().unwrap_or(Server {
             addr,
-            fingerprint: None,
+            fingerprint: known,
         });
         c.busy = true;
         c.error = None;
@@ -1122,10 +1232,6 @@ impl App {
             Backend::Local => self.store.model.clone(),
             Backend::Remote(_) => None,
         };
-        crate::tunnel::carry(match &backend {
-            Backend::Remote(s) => Some(s.clone()),
-            Backend::Local => None,
-        });
         self.backend = backend;
         self.bots.clear();
         self.selected = None;
@@ -1137,6 +1243,7 @@ impl App {
         self.chats.clear();
         self.progress.clear();
         self.server_starting.clear();
+        self.server_browser = None;
         self.server_error = None;
         self.issues.clear();
         self.models.clear();
@@ -1261,9 +1368,6 @@ fn setup(s: &mut App, waker: Waker) {
     {
         s.confirm = Some(Confirm::InstallApp);
     }
-    if let Backend::Remote(server) = &s.backend {
-        crate::tunnel::carry(Some(server.clone()));
-    }
     s.reload_bots();
     if let Some(slug) = s.bots.keys().next().cloned() {
         s.select(&slug);
@@ -1352,6 +1456,7 @@ fn poll(s: &mut App, now: f64, tx: &mut Tx) -> bool {
                         s.apply_bots(st.bots);
                         s.server_starting = st.starting;
                         s.default_model = st.default_model;
+                        s.set_server_browser(st.browser);
                         if s.selected.is_none()
                             && let Some(slug) = s.bots.keys().next().cloned()
                         {
@@ -1459,7 +1564,7 @@ fn view(s: &App, cx: &mut Cx<App>) -> El {
                 .color(k.c.text_base)
                 .truncate(),
         )
-        .trailing(toolbar_actions(s, &k));
+        .trailing(toolbar_actions(s, &k, &mut layer));
     let split = SplitView::new(main_pane(s, &k, &mut layer))
         .sidebar(
             &s.sidebar,
@@ -1534,7 +1639,7 @@ fn small(label: &str, v: ButtonVariant) -> Button {
         .control_size(ControlSize::Small)
 }
 
-fn toolbar_actions(s: &App, k: &Kit) -> El {
+fn toolbar_actions(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     let mut r = row().gap(6.0).items_center();
     if s.busy || !s.starting.is_empty() {
         r = r.child(Spinner::new().build(k));
@@ -1548,31 +1653,7 @@ fn toolbar_actions(s: &App, k: &Kit) -> El {
                     .on_press(|s: &mut App| s.run_now())
                     .build(k),
             )
-            .child(
-                small("Schedule…", ButtonVariant::Ghost)
-                    .on_press(|s: &mut App| s.tab = Tab::Schedule)
-                    .build(k),
-            )
-            .child(
-                small("Environment…", ButtonVariant::Ghost)
-                    .on_press(|s: &mut App| s.open_env(s.selected.clone()))
-                    .build(k),
-            )
-            .child(
-                small("Container…", ButtonVariant::Ghost)
-                    .on_press(|s: &mut App| s.open_sandbox())
-                    .build(k),
-            )
-            .child(
-                small("Upload files…", ButtonVariant::Ghost)
-                    .on_press_tx(|s: &mut App, tx| s.pick_upload(tx, false))
-                    .build(k),
-            )
-            .child(
-                small("Upload folder…", ButtonVariant::Ghost)
-                    .on_press_tx(|s: &mut App, tx| s.pick_upload(tx, true))
-                    .build(k),
-            );
+            .child(bot_menu(s, k, layer));
     }
     let open = s.inspector.is_open();
     r.child(
@@ -1585,6 +1666,74 @@ fn toolbar_actions(s: &App, k: &Kit) -> El {
             .build(k)
             .key("inspector-toggle"),
     )
+}
+
+/// On a server: the server browser, which bots use and you open for sign-ins and handoffs.
+fn server_browser_row(s: &App, k: &Kit) -> El {
+    let Some(b) = &s.server_browser else {
+        return el();
+    };
+    let subtitle = match (b.handoffs.first(), &b.problem) {
+        (Some(h), _) => format!(
+            "A bot needs you: {}",
+            if h.title.is_empty() { &h.url } else { &h.title }
+        ),
+        (None, Some(p)) => p.clone(),
+        (None, None) => "Open it to sign in to sites for your bots".into(),
+    };
+    let mut row = SidebarRow::new(if b.handoffs.is_empty() {
+        "Server browser".to_string()
+    } else {
+        format!("Server browser ({} waiting)", b.handoffs.len())
+    })
+    .subtitle(subtitle)
+    .height(44.0);
+    if !b.handoffs.is_empty() {
+        row = row.icon(&rune_kit::glyphs::SPARKLE);
+    }
+    row.on_select(|s: &mut App, tx: &mut Tx| s.open_server_browser(tx))
+        .build(k)
+        .key("server-browser")
+}
+
+/// A system notification, for when the app is in the background (macOS).
+fn notify_desktop(msg: &str) {
+    if cfg!(target_os = "macos") {
+        let script = format!(
+            "display notification \"{}\" with title \"dumBot\"",
+            msg.replace('\\', "").replace('"', "'")
+        );
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .spawn();
+    }
+}
+
+/// The bot's ••• menu: its schedule, environment, MCP servers, container and uploads.
+fn bot_menu(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
+    let trigger = small("•••", ButtonVariant::Ghost)
+        .on_press(|s: &mut App| s.bot_menu = !s.bot_menu)
+        .build(k)
+        .key("bot-menu-trigger");
+    let item = |label: &str, f: fn(&mut App)| {
+        MenuItem::new(label).on_select(move |s: &mut App| {
+            s.bot_menu = false;
+            f(s);
+        })
+    };
+    Menu::new("bot-menu")
+        .trigger(trigger)
+        .open(s.bot_menu)
+        .on_close(|s: &mut App| s.bot_menu = false)
+        .placement(rune_kit::Placement::BottomEnd)
+        .min_width(200.0)
+        .item(item("Schedule", |s| s.tab = Tab::Schedule))
+        .item(item("Environment…", |s| s.open_env(s.selected.clone())))
+        .item(item("MCP…", |s| s.open_mcp(s.selected.clone())))
+        .item(item("Container…", |s| s.open_sandbox()))
+        .separator()
+        .item(item("Upload…", |s| s.upload_open = true))
+        .build(k, layer)
 }
 
 /// The combobox's current id: the model's key, or "" (the default option) for none. A model
@@ -1702,7 +1851,7 @@ fn sidebar(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     );
     footer = footer
         .child(
-            SidebarRow::new("Instructions for all bots")
+            SidebarRow::new("Instructions")
                 .height(32.0)
                 .on_select(|s: &mut App, _| s.open_instructions())
                 .build(k)
@@ -1715,10 +1864,11 @@ fn sidebar(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
                 .build(k)
                 .key("environment"),
         )
+        .child(server_browser_row(s, k))
         .child(
-            SidebarRow::new("MCP servers for bots")
+            SidebarRow::new("MCP")
                 .height(32.0)
-                .on_select(|s: &mut App, _| s.open_mcp())
+                .on_select(|s: &mut App, _| s.open_mcp(None))
                 .build(k)
                 .key("bot-mcp"),
         )
@@ -2689,28 +2839,10 @@ fn sandbox_dialog(s: &App, e: &SandboxEdit, k: &Kit, layer: &mut Vec<El>) {
             .key(format!("mcp/{name}")),
         );
     }
-    body.push(label(
-        k,
-        "MCP servers only this bot gets (JSON, opencode's mcp format)",
-    ));
-    if !e.global_mcp.is_empty() {
-        body.push(
-            text(format!(
-                "It also gets every bot's: {}.",
-                e.global_mcp.join(", ")
-            ))
-            .font(k.ty.small)
-            .color(k.c.text_faint)
-            .wrap(),
-        );
-    }
     body.push(
-        TextArea::new(&e.own_mcp)
-            .placeholder("{ \"notes\": { \"type\": \"remote\", \"url\": \"https://…/mcp\" } }")
-            .auto_grow(2, 10)
-            .width(None)
-            .on_edit(|s: &mut App| &mut s.sandbox_edit.as_mut().expect("dialog open").own_mcp)
-            .build(k),
+        text("This bot's own MCP servers are under ••• › MCP….")
+            .font(k.ty.small)
+            .color(k.c.text_faint),
     );
     body.push(label(
         k,
@@ -2815,11 +2947,275 @@ fn issues_dialog(s: &App, k: &Kit, layer: &mut Vec<El>) {
     );
 }
 
+fn mcp_dialog(s: &App, e: &McpEdit, k: &Kit, layer: &mut Vec<El>) {
+    let mut body = Vec::new();
+    let row_for = |name: &str, v: &serde_json::Value, actions: Option<El>| {
+        let kind = if v["type"] == "local" {
+            "Local"
+        } else {
+            "Remote"
+        };
+        let mut r = row()
+            .w_full()
+            .gap(10.0)
+            .items_center()
+            .px(10.0)
+            .py(8.0)
+            .radius(8.0)
+            .fill(k.c.layer_01)
+            .child(
+                col()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .gap(2.0)
+                    .child(
+                        row()
+                            .gap(8.0)
+                            .items_center()
+                            .child(
+                                text(name.to_string())
+                                    .font(k.ty.ui_medium)
+                                    .color(k.c.text_base),
+                            )
+                            .child(text(kind).font(k.ty.small).color(k.c.text_faint)),
+                    )
+                    .child(
+                        text(mcp::summary(v))
+                            .font(k.ty.mono)
+                            .color(k.c.text_muted)
+                            .truncate(),
+                    ),
+            );
+        if let Some(a) = actions {
+            r = r.child(a);
+        }
+        r
+    };
+    if e.servers.is_empty() {
+        body.push(
+            text("No servers yet. Add one below.")
+                .font(k.ty.small)
+                .color(k.c.text_faint),
+        );
+    }
+    for (name, v) in &e.servers {
+        let (n1, n2, v1) = (name.clone(), name.clone(), v.clone());
+        let actions = row()
+            .gap(4.0)
+            .child(
+                small("Edit", ButtonVariant::Ghost)
+                    .on_press(move |s: &mut App| {
+                        if let Some(e) = &mut s.mcp_edit {
+                            e.set_form(mcp::Form::of(&n1, &v1), Some(n1.clone()));
+                        }
+                    })
+                    .build(k),
+            )
+            .child(
+                small("Remove", ButtonVariant::GhostFaint)
+                    .on_press(move |s: &mut App| s.remove_mcp(&n2))
+                    .build(k),
+            );
+        body.push(row_for(name, v, Some(actions)).key(format!("mcp/{name}")));
+    }
+    if !e.installed.is_empty() {
+        body.push(label(k, "Installed by the bot (`dumbot mcp`)"));
+        for (name, v) in &e.installed {
+            body.push(row_for(name, v, None).key(format!("mcp-installed/{name}")));
+        }
+    }
+    if !e.global.is_empty() {
+        body.push(
+            text(format!(
+                "It also gets every bot's: {}.",
+                e.global.join(", ")
+            ))
+            .font(k.ty.small)
+            .color(k.c.text_faint)
+            .wrap(),
+        );
+    }
+
+    // The form.
+    let editing = e.editing.clone();
+    body.push(label(
+        k,
+        &match &editing {
+            Some(n) => format!("Edit {n}"),
+            None => "Add a server".into(),
+        },
+    ));
+    body.push(
+        row()
+            .w_full()
+            .gap(8.0)
+            .items_center()
+            .child(
+                TextInput::new(&e.name)
+                    .placeholder("Name, e.g. gmail")
+                    .width(Some(200.0))
+                    .on_edit(|s: &mut App| &mut s.mcp_edit.as_mut().expect("dialog open").name)
+                    .build(k),
+            )
+            .child(
+                SegmentedControl::new(
+                    &["Remote".to_string(), "Local".to_string()],
+                    Some(!e.remote as usize),
+                )
+                .width(Some(180.0))
+                .on_pick(|s: &mut App, i, _: &mut Tx| {
+                    if let Some(e) = &mut s.mcp_edit {
+                        e.remote = i == 0;
+                    }
+                })
+                .build(k),
+            ),
+    );
+    body.push(
+        TextInput::new(&e.target)
+            .placeholder(if e.remote {
+                "https://example.com/mcp"
+            } else {
+                "npx -y @modelcontextprotocol/server-everything"
+            })
+            .width(None)
+            .on_edit(|s: &mut App| &mut s.mcp_edit.as_mut().expect("dialog open").target)
+            .on_submit(|s: &mut App, _| s.save_mcp_form())
+            .build(k),
+    );
+    body.push(
+        TextArea::new(&e.extra)
+            .placeholder(if e.remote {
+                "Headers, one per line: Authorization: Bearer {env:API_TOKEN}"
+            } else {
+                "Environment variables, one per line: API_TOKEN={env:API_TOKEN}"
+            })
+            .auto_grow(2, 6)
+            .width(None)
+            .on_edit(|s: &mut App| &mut s.mcp_edit.as_mut().expect("dialog open").extra)
+            .build(k),
+    );
+    let mut form_actions = row().w_full().gap(8.0).child(
+        text("{env:NAME} is filled in from your environment variables.")
+            .font(k.ty.small)
+            .color(k.c.text_faint)
+            .grow(1.0),
+    );
+    if editing.is_some() {
+        form_actions = form_actions.child(
+            small("Cancel edit", ButtonVariant::Ghost)
+                .on_press(|s: &mut App| {
+                    if let Some(e) = &mut s.mcp_edit {
+                        e.set_form(
+                            mcp::Form {
+                                remote: true,
+                                ..Default::default()
+                            },
+                            None,
+                        );
+                    }
+                })
+                .build(k),
+        );
+    }
+    form_actions = form_actions.child(
+        small(
+            if editing.is_some() { "Save" } else { "Add" },
+            ButtonVariant::Outline,
+        )
+        .on_press(|s: &mut App| s.save_mcp_form())
+        .build(k),
+    );
+    body.push(form_actions);
+
+    let done = Button::new("Done")
+        .variant(ButtonVariant::Contrast)
+        .on_press(close_dialogs)
+        .build(k);
+    let (title, desc) = match &e.bot {
+        None => (
+            "MCP".to_string(),
+            "MCP servers every bot gets, besides the ones from your opencode config each bot turns on under Container…. Local ones run inside each bot's container (which has npx and uvx). Bots get changes from their next run.",
+        ),
+        Some(b) => (
+            format!(
+                "{} MCP",
+                s.bots.get(b).map_or(b.as_str(), |x| x.name.as_str())
+            ),
+            "MCP servers only this bot gets. Local ones run inside its container (which has npx and uvx). It gets changes from its next run.",
+        ),
+    };
+    modal(
+        "mcp",
+        &title,
+        Some(desc),
+        vec![
+            col()
+                .w_full()
+                .gap(8.0)
+                .max_h(560.0)
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .children(body),
+        ],
+        vec![done],
+        k,
+        layer,
+    );
+}
+
+/// Upload files or a folder to the selected bot: choose them, or drop them here.
+fn upload_dialog(k: &Kit, layer: &mut Vec<El>) {
+    let zone = col()
+        .w_full()
+        .h(140.0)
+        .center()
+        .gap(6.0)
+        .radius(10.0)
+        .border(1.0, k.c.border_muted)
+        .fill(k.c.layer_01)
+        .child(
+            text("Drop files or folders here")
+                .font(k.ty.ui_medium)
+                .color(k.c.text_base),
+        )
+        .child(
+            text("They're copied into the bot's files/ folder, wherever it runs.")
+                .font(k.ty.small)
+                .color(k.c.text_faint),
+        )
+        .on_drop_files(|s: &mut App, paths: &[std::path::PathBuf], _: &mut Tx| {
+            if let Some(slug) = s.selected.clone() {
+                s.upload(slug, paths.to_vec());
+            }
+        });
+    let files = Button::new("Choose files…")
+        .variant(ButtonVariant::Contrast)
+        .on_press_tx(|s: &mut App, tx| s.pick_upload(tx, false))
+        .build(k);
+    let folder = Button::new("Choose folder…")
+        .variant(ButtonVariant::Outline)
+        .on_press_tx(|s: &mut App, tx| s.pick_upload(tx, true))
+        .build(k);
+    modal(
+        "upload",
+        "Upload",
+        Some(
+            "Documents, data or references for the bot to use. The bot sees them in files/, and the Files tab lists them.",
+        ),
+        vec![zone],
+        vec![cancel(k), folder, files],
+        k,
+        layer,
+    );
+}
+
 fn connect_dialog(s: &App, c: &ConnectEdit, k: &Kit, layer: &mut Vec<El>) {
     let mut body = vec![
         label(k, "Server address"),
         TextInput::new(&c.addr)
-            .placeholder("192.168.1.20 or myserver:7457")
+            .placeholder("192.168.1.20, myserver:7457 or wss://bots.example.com")
             .width(None)
             .on_edit(|s: &mut App| &mut s.connect.as_mut().expect("dialog open").addr)
             .on_submit(|s: &mut App, _| s.try_connect())
@@ -2909,7 +3305,7 @@ fn connect_dialog(s: &App, c: &ConnectEdit, k: &Kit, layer: &mut Vec<El>) {
         "server",
         "Where bots run",
         Some(
-            "Bots run on this computer, or on a dumBot server (`dumbot install-server` on that machine). Connected to a server, this app manages its bots, and the server runs them on schedule while the app is closed, with your opencode config and logins.",
+            "Bots run on this computer, or on a dumBot server (`dumbot install-server` on that machine). Connected to a server, this app manages its bots, and the server runs them on schedule while the app is closed. The address is host or host:port, or wss://… for a server behind a Cloudflare tunnel (`dumbot server tunnel`). Changing the address keeps the pairing, and only connects to the same server.",
         ),
         body,
         actions,
@@ -2929,6 +3325,7 @@ fn close_dialogs(s: &mut App) {
     s.sandbox_edit = None;
     s.connect = None;
     s.mcp_edit = None;
+    s.upload_open = false;
 }
 
 fn modal(
@@ -2990,7 +3387,7 @@ fn dialogs(s: &App, k: &Kit, layer: &mut Vec<El>) {
             .build(k);
         modal(
             "instructions",
-            "Instructions for all bots",
+            "Instructions",
             Some(
                 "Part of every bot's system prompt, and its subagents'. Takes effect from each bot's next run.",
             ),
@@ -3013,27 +3410,10 @@ fn dialogs(s: &App, k: &Kit, layer: &mut Vec<El>) {
         connect_dialog(s, c, k, layer);
     }
     if let Some(e) = &s.mcp_edit {
-        let area = TextArea::new(&e.text)
-            .placeholder("{\n  \"gotify\": { \"type\": \"remote\", \"url\": \"https://…/mcp\", \"headers\": { \"Authorization\": \"Bearer …\" } },\n  \"tool\": { \"type\": \"local\", \"command\": [\"npx\", \"-y\", \"some-mcp\"] }\n}")
-            .auto_grow(10, 24)
-            .width(None)
-            .on_edit(|s: &mut App| &mut s.mcp_edit.as_mut().expect("dialog open").text)
-            .build(k);
-        let save = Button::new("Save")
-            .variant(ButtonVariant::Contrast)
-            .on_press(|s: &mut App| s.save_mcp())
-            .build(k);
-        modal(
-            "bot-mcp",
-            "MCP servers for bots",
-            Some(
-                "Every bot gets these, as well as the MCP servers from your opencode config it's turned on (Container…), and its own. A JSON object of servers by name, in opencode's mcp format. Local servers run inside the bot's container.",
-            ),
-            vec![area],
-            vec![cancel(k), save],
-            k,
-            layer,
-        );
+        mcp_dialog(s, e, k, layer);
+    }
+    if s.upload_open {
+        upload_dialog(k, layer);
     }
     if let Some((name, purpose)) = &s.new_bot {
         let name = TextInput::new(name)
@@ -3322,8 +3702,6 @@ pub fn main() {
                             Some("runs `railway` inside the container, which has only the image's programs, not your computer's".into()),
                         ),
                     ],
-                    own_mcp: TextEdit::new("{\n  \"notes\": { \"type\": \"remote\", \"url\": \"https://notes.example/mcp\" }\n}"),
-                    global_mcp: vec!["gotify".into()],
                 });
             }),
             ("environment", |s: &mut App| {
@@ -3370,10 +3748,52 @@ pub fn main() {
             ("bot-mcp", |s: &mut App| {
                 demo(s);
                 s.mcp_edit = Some(McpEdit {
-                    text: TextEdit::new(
-                        "{\n  \"gotify\": {\n    \"type\": \"remote\",\n    \"url\": \"https://gotify.example/mcp\"\n  }\n}",
-                    ),
+                    bot: Some("inbox-triager".into()),
+                    servers: mcp::Servers::from([
+                        (
+                            "gmail".into(),
+                            serde_json::json!({ "type": "remote", "url": "https://gmail.example/mcp", "headers": { "Authorization": "Bearer {env:GMAIL_TOKEN}" } }),
+                        ),
+                        (
+                            "files".into(),
+                            serde_json::json!({ "type": "local", "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "files"] }),
+                        ),
+                    ]),
+                    global: vec!["gotify".into()],
+                    installed: mcp::Servers::from([(
+                        "everything".into(),
+                        serde_json::json!({ "type": "local", "command": ["npx", "-y", "@modelcontextprotocol/server-everything"] }),
+                    )]),
+                    editing: Some("gmail".into()),
+                    name: TextEdit::new("gmail"),
+                    remote: true,
+                    target: TextEdit::new("https://gmail.example/mcp"),
+                    extra: TextEdit::new("Authorization: Bearer {env:GMAIL_TOKEN}"),
                 });
+            }),
+            ("server-browser", |s: &mut App| {
+                demo(s);
+                s.backend = Backend::Remote(Server {
+                    addr: "wss://dumbot.example.com".into(),
+                    fingerprint: None,
+                });
+                s.server_browser = Some(crate::browser::Info {
+                    problem: None,
+                    handoffs: vec![crate::browser::Handoff {
+                        tab: 1,
+                        url: "https://accounts.google.com/".into(),
+                        title: "Sign in - Google Accounts".into(),
+                        since: String::new(),
+                    }],
+                });
+            }),
+            ("bot-menu", |s: &mut App| {
+                demo(s);
+                s.bot_menu = true;
+            }),
+            ("upload", |s: &mut App| {
+                demo(s);
+                s.upload_open = true;
             }),
             ("instructions", |s: &mut App| {
                 demo(s);

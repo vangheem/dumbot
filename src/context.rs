@@ -29,13 +29,6 @@ pub struct HostContext {
     /// opencode's stored logins (`/api/credential`), secrets included.
     #[serde(default)]
     pub credentials: Vec<Value>,
-    /// The browse version and relay token, when browse is set up (see `tunnel`).
-    #[serde(default)]
-    pub browse_version: Option<String>,
-    #[serde(default)]
-    pub browse_token: Option<String>,
-    #[serde(default)]
-    pub browse_port: Option<u16>,
     /// The opencode config folder's files: relative path and base64 contents.
     #[serde(default)]
     pub config: Vec<(String, String)>,
@@ -52,11 +45,6 @@ fn dir() -> PathBuf {
 /// Where a server keeps the app's opencode config, mounted into bots' containers.
 pub fn config_dir() -> PathBuf {
     dir().join("opencode")
-}
-
-/// The app's browse relay token, on a server.
-pub fn relay_token() -> PathBuf {
-    dir().join("browse-relay-token")
 }
 
 /// The app's context on a server; `None` everywhere else.
@@ -81,9 +69,6 @@ pub fn gather() -> HostContext {
         credentials: crate::opencode::Client::connect()
             .and_then(|c| c.credentials())
             .unwrap_or_default(),
-        browse_version: container::browse_version(),
-        browse_token: std::fs::read_to_string(container::browse_token_file()).ok(),
-        browse_port: container::browse_port().ok(),
         config,
     }
 }
@@ -131,12 +116,6 @@ pub fn save(ctx: &HostContext) -> Result<()> {
         }
         std::fs::create_dir_all(p.parent().unwrap())?;
         std::fs::write(p, base64::engine::general_purpose::STANDARD.decode(body)?)?;
-    }
-    match &ctx.browse_token {
-        Some(t) => crate::remote::write_private(&relay_token(), t.as_bytes())?,
-        None => {
-            let _ = std::fs::remove_file(relay_token());
-        }
     }
     let mut kept = ctx.clone();
     kept.config.clear();

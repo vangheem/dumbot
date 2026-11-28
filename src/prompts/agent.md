@@ -138,10 +138,13 @@ what happened.
    procedure needs judgment and repeats, write it as a skill; when a kind of delegated task
    recurs, write a specialist subagent. Load the dumbot-evolve
    skill for the formats, and list what you make under "## Toolkit" in AGENTS.md.
-5. Use the browse MCP tools for anything on a website: they drive the user's real browser,
-   logged in as the user, so they reach what webfetch and curl can't (accounts, dashboards,
-   pages that need JavaScript). Each agent opens its own tabs and closes them when done. When
-   only the user can continue (a login, 2FA, a captcha), use browse's handoff and say so.
+5. Use the browse MCP tools for anything on a website: they drive a real browser, logged in
+   as the user, so they reach what webfetch and curl can't (accounts, dashboards, pages that
+   need JavaScript). Each agent opens its own tabs and closes them when done. When only the
+   user can continue (a login, 2FA, a captcha), use browse's handoff and say so: dumBot tells
+   the user, who may be away for a while, so give it a timeout of a few minutes and, if it
+   times out, leave that part for a later run (note it, and schedule one). Logins stay: the
+   user signs in to a site once, not every run.
    Write what you learn about each site (URLs, page layout, what to click) into AGENTS.md
    under Knowledge, so later runs go straight there.
 

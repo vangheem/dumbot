@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 use crate::api::{self, Request};
 use crate::remote::{self, Clients, Identity};
+use crate::transport::Sock;
 use crate::{bots, container, schedule};
 
 const SCAN: Duration = Duration::from_secs(5);
@@ -24,6 +25,9 @@ pub const USAGE: &str = "\
   dumbot server approve <code>   pair the app showing <code>
   dumbot server clients          list paired apps and pending requests
   dumbot server revoke <fp>      unpair an app (by fingerprint prefix)
+  dumbot server tunnel <hostname>
+                                 reach this server from anywhere through a Cloudflare tunnel
+                                 (needs cloudflared, logged in: `cloudflared tunnel login`)
   dumbot install-server [--listen ADDR]
                                  run `dumbot server` as a service, at boot (systemd, launchd)
   dumbot uninstall-server
@@ -61,6 +65,7 @@ pub fn cli(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
+        Some("tunnel") => tunnel(&args[1..]),
         Some("revoke") => {
             let prefix = args
                 .get(1)
@@ -106,8 +111,12 @@ fn serve(listen: &str) -> Result<()> {
     {
         std::thread::spawn(updater);
     }
-    if let Err(e) = crate::tunnel::listen() {
-        eprintln!("browse: {e:#}; bots can't use browse");
+    if crate::browser::supported() {
+        std::thread::spawn(|| {
+            if let Err(e) = crate::browser::ensure() {
+                eprintln!("server browser: {e:#}");
+            }
+        });
     }
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -126,7 +135,9 @@ fn serve(listen: &str) -> Result<()> {
 }
 
 fn connection(tcp: TcpStream, cfg: Arc<rustls::ServerConfig>) -> Result<()> {
-    let peer = tcp.peer_addr()?;
+    // Straight from the app, or through a proxy as a WebSocket (see `transport`).
+    let tcp = Sock::accept(tcp)?;
+    let peer = tcp.peer();
     tcp.set_read_timeout(Some(Duration::from_secs(60)))?;
     tcp.set_write_timeout(Some(Duration::from_secs(60)))?;
     let mut tls = rustls::StreamOwned::new(rustls::ServerConnection::new(cfg)?, tcp);
@@ -156,13 +167,8 @@ fn connection(tcp: TcpStream, cfg: Arc<rustls::ServerConfig>) -> Result<()> {
         remote::write_line(&mut tls, &json!({ "unpaired": true }))?;
         return finish(&mut tls);
     }
-    match req["op"].as_str() {
-        Some("browse_tunnel") => return crate::tunnel::serve_control(tls),
-        Some("browse_data") => {
-            let id = req["id"].as_u64().unwrap_or_default();
-            return crate::tunnel::serve_data(tls, id, leftover);
-        }
-        _ => {}
+    if req["op"] == "browser_view" {
+        return crate::view::serve(tls, leftover);
     }
     let res = serde_json::from_value::<Request>(req)
         .map_err(|e| anyhow!("unknown request (is the app a different version?): {e}"));
@@ -170,7 +176,26 @@ fn connection(tcp: TcpStream, cfg: Arc<rustls::ServerConfig>) -> Result<()> {
     let step = |s: &str| {
         let _ = remote::write_line(&mut **out.lock().unwrap(), &json!({ "step": s }));
     };
-    let res = res.and_then(|r| api::handle(r, &step));
+    // A slow request (building an image) pings now and then, so the connection, and any
+    // proxy on the way, doesn't count it as idle.
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let res = std::thread::scope(|sc| {
+        sc.spawn(|| {
+            let mut waited = Duration::ZERO;
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(250));
+                waited += Duration::from_millis(250);
+                if waited >= Duration::from_secs(30) {
+                    waited = Duration::ZERO;
+                    let _ =
+                        remote::write_line(&mut **out.lock().unwrap(), &json!({ "ping": true }));
+                }
+            }
+        });
+        let res = res.and_then(|r| api::handle(r, &step));
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        res
+    });
     let tls = out.into_inner().unwrap();
     match res {
         Ok(v) => remote::write_line(tls, &json!({ "ok": v }))?,
@@ -179,7 +204,7 @@ fn connection(tcp: TcpStream, cfg: Arc<rustls::ServerConfig>) -> Result<()> {
     finish(tls)
 }
 
-fn finish(tls: &mut rustls::StreamOwned<rustls::ServerConnection, TcpStream>) -> Result<()> {
+fn finish(tls: &mut rustls::StreamOwned<rustls::ServerConnection, Sock>) -> Result<()> {
     tls.conn.send_close_notify();
     tls.flush()?;
     Ok(())
@@ -201,6 +226,20 @@ fn scheduler() {
 /// pauses containers with nothing to do: no working run, not starting, and not looked at in
 /// the app lately.
 fn tick(last_busy: &mut HashMap<String, Instant>) -> Result<()> {
+    // The server browser: running, and on the current image. Docker restarts it after a
+    // reboot; this catches the rest (an update, someone stopping it).
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    if crate::browser::supported() {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_none_or(|t| t.elapsed() > Duration::from_secs(60)) {
+            *last = Some(Instant::now());
+            std::thread::spawn(|| {
+                if let Err(e) = crate::browser::ensure() {
+                    eprintln!("server browser: {e:#}");
+                }
+            });
+        }
+    }
     let states = container::states()?;
     let active = api::active(&states);
     let starting = api::starting();
@@ -238,6 +277,156 @@ fn tick(last_busy: &mut HashMap<String, Instant>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ---- a Cloudflare tunnel -----------------------------------------------------------------
+
+const TUNNEL: &str = "dumbot";
+const TUNNEL_UNIT: &str = "dumbot-tunnel.service";
+
+fn cloudflared() -> Result<String> {
+    let local = home().join(".local/bin/cloudflared");
+    if local.exists() {
+        return Ok(local.display().to_string());
+    }
+    container::command_output("sh", &["-c", "command -v cloudflared"]).ok_or_else(|| {
+        anyhow!(
+            "cloudflared isn't installed: \
+             https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
+        )
+    })
+}
+
+/// `dumbot server tunnel <hostname>`: a Cloudflare tunnel of its own (`dumbot`) from
+/// `hostname` to this server, run as a service. The app connects to `wss://<hostname>`;
+/// Cloudflare carries the WebSocket, and inside it is the same pinned TLS as on the network.
+fn tunnel(args: &[String]) -> Result<()> {
+    let hostname = args
+        .first()
+        .ok_or_else(|| anyhow!("usage: dumbot server tunnel <hostname>, like bots.example.com"))?
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("wss://")
+        .trim_end_matches('/')
+        .to_string();
+    if cfg!(target_os = "macos") {
+        return Err(anyhow!(
+            "`dumbot server tunnel` sets up a systemd service; on macOS, run cloudflared yourself (see the README)"
+        ));
+    }
+    let cf = cloudflared()?;
+    let dir = home().join(".cloudflared");
+    if !dir.join("cert.pem").exists() {
+        return Err(anyhow!(
+            "cloudflared isn't logged in to your Cloudflare account; run `{cf} tunnel login` first"
+        ));
+    }
+    // `~/.cloudflared/config.yml` may name another tunnel, which cloudflared would use in place
+    // of the one named here: tunnel commands get an empty config instead.
+    let output = |args: &[&str]| -> Result<String> {
+        let mut all = vec!["tunnel", "--config", "/dev/null"];
+        all.extend(&args[1..]);
+        let out = std::process::Command::new(&cf).args(&all).output()?;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if out.status.success() {
+            Ok(text)
+        } else {
+            Err(anyhow!("cloudflared {}: {}", args.join(" "), text.trim()))
+        }
+    };
+    let find = || -> Result<Option<String>> {
+        let list: Value = serde_json::from_str(
+            &std::process::Command::new(&cf)
+                .args([
+                    "tunnel",
+                    "--config",
+                    "/dev/null",
+                    "list",
+                    "--output",
+                    "json",
+                    "--name",
+                    TUNNEL,
+                ])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())?,
+        )
+        .unwrap_or(Value::Null);
+        Ok(list
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|t| t["id"].as_str())
+            .map(String::from))
+    };
+    let id = match find()? {
+        Some(id) => id,
+        None => {
+            println!("Creating the Cloudflare tunnel {TUNNEL:?}…");
+            output(&["tunnel", "create", TUNNEL])?;
+            find()?.ok_or_else(|| anyhow!("cloudflared created no tunnel"))?
+        }
+    };
+    println!("Pointing {hostname} at it…");
+    // By id, replacing whatever the name pointed at before.
+    output(&["tunnel", "route", "dns", "--overwrite-dns", &id, &hostname])?;
+    let port = listen_port();
+    let config = dir.join("dumbot.yml");
+    std::fs::write(
+        &config,
+        format!(
+            "# Written by `dumbot server tunnel`.\n\
+             tunnel: {id}\n\
+             credentials-file: {}\n\
+             ingress:\n  \
+               - hostname: {hostname}\n    \
+                 service: http://127.0.0.1:{port}\n  \
+               - service: http_status:404\n",
+            dir.join(format!("{id}.json")).display()
+        ),
+    )?;
+    let unit = home().join(".config/systemd/user").join(TUNNEL_UNIT);
+    std::fs::create_dir_all(unit.parent().unwrap())?;
+    std::fs::write(
+        &unit,
+        format!(
+            "[Unit]\n\
+             Description=Cloudflare tunnel to the dumBot server ({hostname})\n\
+             After=network-online.target {UNIT}\n\
+             Wants=network-online.target\n\n\
+             [Service]\n\
+             ExecStart={cf} --no-autoupdate tunnel --config {} run {TUNNEL}\n\
+             Restart=always\n\
+             RestartSec=5\n\n\
+             [Install]\n\
+             WantedBy=default.target\n",
+            config.display()
+        ),
+    )?;
+    run("systemctl", &["--user", "daemon-reload"])?;
+    run("systemctl", &["--user", "enable", TUNNEL_UNIT])?;
+    run("systemctl", &["--user", "restart", TUNNEL_UNIT])?;
+    println!(
+        "Done: wss://{hostname} reaches this server, now and after reboots.\n\
+         In the app, choose Server… and change the address to wss://{hostname}; it stays \
+         paired (the server's key is the same)."
+    );
+    Ok(())
+}
+
+/// The port the installed service listens on.
+fn listen_port() -> u16 {
+    std::fs::read_to_string(home().join(".config/systemd/user").join(UNIT))
+        .ok()
+        .and_then(|u| {
+            u.split_whitespace()
+                .skip_while(|w| *w != "--listen")
+                .nth(1)
+                .and_then(|a| a.rsplit(':').next()?.parse().ok())
+        })
+        .unwrap_or(remote::DEFAULT_PORT)
 }
 
 // ---- updates ------------------------------------------------------------------------------

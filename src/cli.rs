@@ -142,9 +142,10 @@ fn connect(args: &[String]) -> Result<()> {
         args.first()
             .ok_or_else(|| anyhow!("usage: dumbot connect <host[:port]>"))?,
     );
+    // A new address for the server this app is paired with keeps its key (see the app's).
     let mut server = crate::remote::Server {
         addr: addr.clone(),
-        fingerprint: None,
+        fingerprint: store::Store::load().remote.and_then(|r| r.fingerprint),
     };
     let mut shown = false;
     loop {

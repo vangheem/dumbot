@@ -211,6 +211,11 @@ pub fn create(name: &str, purpose: &str) -> Result<String> {
         &slug,
         &Bot {
             name: name.into(),
+            // Most bots work on websites.
+            sandbox: Sandbox {
+                tools: vec!["browse".into()],
+                ..Sandbox::default()
+            },
             ..Bot::default()
         },
     )?;

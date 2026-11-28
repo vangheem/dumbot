@@ -236,7 +236,8 @@ fn image_spec() -> ImageSpec {
         (
             "BROWSE_VERSION".into(),
             match crate::context::current() {
-                Some(c) => c.browse_version,
+                // A server's bots use the server browser's relay: the same version.
+                Some(_) => crate::browser::version(),
                 None => browse_version(),
             }
             .unwrap_or_default(),
@@ -368,20 +369,13 @@ fn browse_bin() -> Option<String> {
 }
 
 /// The host's browse relay port, starting the relay when it isn't running. On a server, the
-/// port the app carries to its relay (see `tunnel`).
+/// server browser's (see `browser`).
 pub fn browse_port() -> Result<u16> {
-    if let Some(c) = crate::context::current() {
-        if c.browse_token.is_none() {
-            return Err(anyhow!("browse isn't set up on the app's computer"));
-        }
-        if !crate::tunnel::connected() {
-            return Err(anyhow!(
-                "bots on a server use the browser on the app's computer, and the app isn't \
-                 connected now; they can use browse while it's open"
-            ));
-        }
-        return crate::tunnel::port()
-            .ok_or_else(|| anyhow!("browse isn't set up on the app's computer"));
+    if crate::context::current().is_some() {
+        return match crate::browser::info().problem {
+            None => Ok(crate::browser::RELAY_PORT),
+            Some(p) => Err(anyhow!("{p}")),
+        };
     }
     let bin = browse_bin().ok_or_else(|| anyhow!("browse isn't installed on this computer"))?;
     let port = || -> Option<u16> {
@@ -547,7 +541,7 @@ pub fn mcp_config(slug: &str, bot: &Bot) -> Value {
     if bot.sandbox.has_tool("browse") {
         let mut env = json!({ "OPENCODE_BROWSER_AUTO_UPDATE": "off" });
         let port = match crate::context::current() {
-            Some(_) => crate::tunnel::port(),
+            Some(_) => Some(crate::browser::RELAY_PORT),
             None => browse_port().ok(),
         };
         if let Some(p) = port {
@@ -735,7 +729,7 @@ fn container_spec(slug: &str, bot: &Bot, image: &str) -> Result<Spec> {
     if bot.sandbox.has_tool("browse") {
         let token = browse_token_file();
         let src = match crate::context::current() {
-            Some(_) => crate::context::relay_token(),
+            Some(_) => crate::browser::token_file(),
             None => token.clone(),
         };
         if src.exists() {
@@ -744,7 +738,7 @@ fn container_spec(slug: &str, bot: &Bot, image: &str) -> Result<Spec> {
         // On a server the port is fixed, so it's in the spec whether or not the app is
         // connected right now.
         let port = match crate::context::current() {
-            Some(_) => crate::tunnel::port(),
+            Some(_) => Some(crate::browser::RELAY_PORT),
             None => browse_port().ok(),
         };
         if !host_network()
@@ -909,6 +903,10 @@ fn ensure_inner(slug: &str, bot: &Bot, step: Step) -> Result<Client> {
     check_docker()?;
     step("Checking the bot image");
     let image = ensure_image(step)?;
+    if crate::context::current().is_some() && bot.sandbox.has_tool("browse") {
+        step("Starting the server browser");
+        crate::browser::ensure()?;
+    }
     step("Preparing the container");
     write_runtime_files(slug, bot)?;
     let spec = container_spec(slug, bot, &image)?;

@@ -11,6 +11,7 @@ mod api;
 mod app;
 mod appbundle;
 mod bots;
+mod browser;
 mod cli;
 mod container;
 mod context;
@@ -21,8 +22,9 @@ mod remote;
 mod schedule;
 mod server;
 mod store;
-mod tunnel;
+mod transport;
 mod update;
+mod view;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

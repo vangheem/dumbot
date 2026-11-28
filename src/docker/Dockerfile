@@ -43,13 +43,15 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# BROWSE_VERSION is the host's: a new one rebuilds the image, which installs the current
-# stable release (the installer can't pin versions on every platform).
+# BROWSE_VERSION is the relay's (the host's, or on a server the server browser's): the MCP
+# server installed here must match it. A new one rebuilds the image.
 ARG BROWSE_VERSION
 RUN if [ -n "$BROWSE_VERSION" ]; then \
-        curl -fsSL https://opencode.ai/browse/install \
-        | HOME=/tmp/browse XDG_BIN_HOME=/usr/local/bin sh -s -- --no-setup \
-        && rm -rf /tmp/browse; \
+        { curl -fsSL https://opencode.ai/browse/install \
+            | HOME=/tmp/browse XDG_BIN_HOME=/usr/local/bin sh -s -- --no-setup --version "$BROWSE_VERSION" \
+          || curl -fsSL https://opencode.ai/browse/install \
+            | HOME=/tmp/browse XDG_BIN_HOME=/usr/local/bin sh -s -- --no-setup; } \
+        && rm -rf /tmp/browse && browse version; \
     fi
 
 ARG TARGETARCH

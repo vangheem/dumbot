@@ -15,8 +15,8 @@
 //! Requests are one JSON line per connection. The server answers with `{"step": …}` lines
 //! (progress) and then `{"ok": …}` or `{"err": …}`, or `{"unpaired": true}`.
 
+use crate::transport::Sock;
 use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -352,9 +352,12 @@ impl ServerCertVerifier for PinnedServer {
     }
 }
 
-/// `host` or `host:port`, with the default port.
+/// `host` or `host:port`, with the default port; a `wss://` URL (a proxy) as it is.
 pub fn normalize_addr(addr: &str) -> String {
-    let a = addr.trim();
+    let a = addr.trim().trim_end_matches('/');
+    if a.contains("://") {
+        return a.to_string();
+    }
     if a.rsplit_once(':')
         .is_some_and(|(_, p)| p.parse::<u16>().is_ok())
     {
@@ -399,7 +402,7 @@ impl Server {
         request: &Value,
         timeout: Duration,
     ) -> Result<(
-        BufReader<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>,
+        BufReader<rustls::StreamOwned<rustls::ClientConnection, Sock>>,
         String,
     )> {
         let id = Identity::load("client")?;
@@ -413,14 +416,7 @@ impl Server {
             .dangerous()
             .with_custom_certificate_verifier(verifier.clone())
             .with_client_auth_cert(chain, key)?;
-        let addr = self
-            .addr
-            .to_socket_addrs()
-            .with_context(|| format!("resolve {}", self.addr))?
-            .next()
-            .ok_or_else(|| anyhow!("{} has no address", self.addr))?;
-        let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-            .with_context(|| format!("connect to the dumBot server at {}", self.addr))?;
+        let tcp = Sock::connect(&self.addr)?;
         tcp.set_read_timeout(Some(timeout))?;
         tcp.set_write_timeout(Some(Duration::from_secs(60)))?;
         let conn = rustls::ClientConnection::new(Arc::new(cfg), ServerName::try_from("dumbot")?)?;
@@ -440,7 +436,7 @@ impl Server {
         &self,
         request: &Value,
         timeout: Duration,
-    ) -> Result<BufReader<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>> {
+    ) -> Result<BufReader<rustls::StreamOwned<rustls::ClientConnection, Sock>>> {
         Ok(self.connect(request, timeout)?.0)
     }
 
@@ -461,6 +457,10 @@ impl Server {
             let v: Value = serde_json::from_str(&line)?;
             if let Some(s) = v["step"].as_str() {
                 step(s);
+                continue;
+            }
+            // Keeps a slow request's connection (and any proxy on the way) from going idle.
+            if v["ping"] == true {
                 continue;
             }
             if v["unpaired"] == true {
@@ -508,5 +508,9 @@ mod tests {
         assert_ne!(a, pairing_code("s1", "c2"));
         assert_eq!(normalize_addr("box"), "box:7457");
         assert_eq!(normalize_addr("box:9"), "box:9");
+        assert_eq!(
+            normalize_addr("wss://bots.example.com/"),
+            "wss://bots.example.com"
+        );
     }
 }
